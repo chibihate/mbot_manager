@@ -1,13 +1,25 @@
 import tkinter as tk
 import win32gui
 import win32con
+import win32com.client
 from tkinter import ttk, messagebox
 from pywinauto import findwindows
 import time
 import ctypes
+from tkinter import filedialog
+import os
+import base64
+import json
+import subprocess
+import uiautomation as auto
+import re
+from collections import defaultdict
+
+FILE_NAME = "accounts.json"
+accounts = None
 
 WINDOW_WIDTH = 1200
-WINDOW_HEIGHT = 600
+WINDOW_HEIGHT = 620
 TOP_LEFT_X = 0
 TOP_LEFT_Y = 0
 CHAT_BUTTON_TEXTS = ["Allchat", "PM", "Party", "Guild", "Global", "Academy", "GM", "Union", "Unique"]
@@ -29,7 +41,7 @@ tcvn3_to_unicode = {
     # Lowercase i
     '×':'ì', 'Ý':'í', 'Ø':'ỉ', 'Ü':'ĩ', 'Þ':'ị',
 
-    # # Lowercase o
+    # Lowercase o
     'ß':'ò', 'ã':'ó', 'á':'ỏ', 'â':'õ', 'ä':'ọ',
     '«':'ô', 'å':'ồ', 'è':'ố', 'æ':'ổ', 'ç':'ỗ', 'é':'ộ',
     '¬':'ơ', 'ê':'ờ', 'í':'ớ', 'ë':'ở', 'ì':'ỡ', 'î':'ợ',
@@ -41,8 +53,17 @@ tcvn3_to_unicode = {
     # Lowercase y
     'ú':'ỳ', 'ý':'ý', 'û':'ỷ', 'ü':'ỹ', 'þ':'ỵ',
 
-    #Uppercase D
+    # Uppercase D
     "§": "Đ",
+
+    # Uppercase E
+    "£": "Ê",
+
+    # Upper case O
+    "¤": "Ô", "¥": "Ơ",
+
+    # Upper case U
+    "¦": "Ư"
 }
 
 def tcvn3_to_unicode_text(text):
@@ -55,6 +76,16 @@ def extract_progress_bar(num_string):
     current = int(parts[0].replace(",", "").strip())
     total = int(parts[1].replace(",", "").strip())
     return current * 100 / total
+
+def load_accounts():
+    if os.path.exists(FILE_NAME):
+        with open(FILE_NAME, "r") as f:
+            return json.load(f)
+    return []
+
+def save_accounts():
+    with open(FILE_NAME, "w") as f:
+        json.dump(accounts, f, indent=4)
 
 class MBot():
     def __init__(self, mbot):
@@ -142,9 +173,9 @@ class MBot():
             name = element.name
             split_name = name.split(":")
             if len(split_name) > 1 and split_name[0] == "Name":
-                self.name = split_name[1]
+                self.name = split_name[1].strip()
             else:
-                self.name = split_name[0]
+                self.name = split_name[0].strip()
         return self.name
 
     def get_stats(self):
@@ -377,7 +408,6 @@ class MBot():
 class ItemHpMpRow:
     def __init__(self, parent, row):
         self.frame = parent
-        # Create widgets
         self.name_label = ttk.Label(self.frame, text="Name: X")
         self.kill_label = ttk.Label(self.frame, text="")
         self.hp_label = ttk.Label(self.frame, text="HP:")
@@ -385,7 +415,6 @@ class ItemHpMpRow:
         self.hp_value = ttk.Progressbar(self.frame, mode="determinate", length=100)
         self.mp_value = ttk.Progressbar(self.frame, mode="determinate", length=100)
 
-        # Place widgets using grid
         self.name_label.grid(row=row, column=0, padx=5, pady=2, sticky="w")
         self.hp_label.grid(row=row, column=1, padx=0, pady=2, sticky="w")
         self.hp_value.grid(row=row, column=2, padx=0, pady=2, sticky="w")
@@ -401,12 +430,9 @@ class ItemHpMpRow:
         self.name_label.destroy()
         self.kill_label.destroy()
 
-class MBotManager(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("mBot Controller")
-        self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
-        self.resizable(False, False)
+class Monitor(tk.Frame):
+    def __init__(self, master=None):
+        super().__init__(master)
         self.mbot_list = []
         self.hp_mp_list = []
         self.hp_mp_frame = None
@@ -488,6 +514,9 @@ class MBotManager(tk.Tk):
                 self.chat_read_text.delete("1.0", "end")
                 self.chat_read_text.insert("1.0", content)
                 self.chat_read_text.see("end")
+            else:
+                self.chat_read_text.delete("1.0", "end")
+                return
 
         self.update_chat_job = self.after(20000, lambda: self.update_chat(mbot, button_name))
 
@@ -518,9 +547,43 @@ class MBotManager(tk.Tk):
         for i in range(total_buttons):
             frame.grid_columnconfigure(i, weight=1)
 
-        self.chat_read_text = tk.Text(frame, height=15, state="disabled")
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.grid(row=1, column=total_buttons, sticky="ns")
+
+        self.chat_read_text = tk.Text(frame, height=15, state="disabled", yscrollcommand=scrollbar.set)
         self.chat_read_text.grid(row=1, column=0, columnspan=total_buttons, sticky="ew", padx=5, pady=5)
         self.chat_read_text.config(state="normal")
+
+        scrollbar.config(command=self.chat_read_text.yview)
+
+    def update_inventory_pieces_log(self):
+        selected = self.bot_name_list.curselection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please choose one mbot")
+            return
+
+        mbot_list = [self.mbot_list[i] for i in selected]
+        if len(mbot_list) > 1:
+            messagebox.showwarning("Warning", "Please choose only one mbot")
+            return
+
+        selected_option = self.inventory_combo_var.get()
+        index_option = self.inventory_options.index(selected_option)
+        mbot_list[0].set_inventory_combo(index_option)
+        mbot_list[0].refresh_inventory()
+        content = mbot_list[0].get_inventory_items()
+        if content is not None:
+            item_totals = defaultdict(int)
+            self.log_read_text.delete("1.0", "end")
+            for line in content:
+                match = re.search(r':\s*(.*?)\s*\((\d+)\s+pieces\)', line)
+                if match:
+                    item_name = match.group(1)
+                    quantity = int(match.group(2))
+                    item_totals[item_name] += quantity
+            for item in sorted(item_totals):
+                self.log_read_text.insert("end", f"{item}: {item_totals[item]} pieces")
+                self.log_read_text.insert("end", "\n")
 
     def update_inventory_log(self):
         selected = self.bot_name_list.curselection()
@@ -577,8 +640,9 @@ class MBotManager(tk.Tk):
     def create_inventory_log_frame(self, parent_frame):
         frame = ttk.Frame(parent_frame)
         frame.pack(fill='x', pady=2)
+        columnspan_log = 15
 
-        for i in range(15):
+        for i in range(columnspan_log):
             frame.grid_columnconfigure(i, weight=1)
 
         self.inventory_combo_var = tk.StringVar()
@@ -589,13 +653,22 @@ class MBotManager(tk.Tk):
         inventory_button = ttk.Button(frame, text="Refresh", command=self.update_inventory_log)
         inventory_button.grid(row=0, column=1, padx=0, pady=0)
 
+        inventory_button = ttk.Button(frame, text="Only pieces", command=self.update_inventory_pieces_log)
+        inventory_button.grid(row=0, column=2, padx=0, pady=0)
+
         log_button = ttk.Button(frame, text="Log", command=self.update_log)
         log_button.grid(row=0, column=13, padx=0, pady=0)
         clear_button = ttk.Button(frame, text="Clear", command=self.clear_log)
         clear_button.grid(row=0, column=14, padx=0, pady=0)
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.grid(row=1, column=columnspan_log, sticky="ns")
+
         self.log_read_text = tk.Text(frame, height=14, state="disabled")
-        self.log_read_text.grid(row=1, column=0, columnspan=15, sticky="ew", padx=5, pady=5)
+        self.log_read_text.grid(row=1, column=0, columnspan=columnspan_log, sticky="ew", padx=5, pady=5)
         self.log_read_text.config(state="normal")
+
+        scrollbar.config(command=self.log_read_text.yview)
 
     def create_right_frame(self, x, y, width, height):
         frame = ttk.Frame(self)
@@ -623,12 +696,12 @@ class MBotManager(tk.Tk):
         right_frame_height = WINDOW_HEIGHT
         right_frame_x = WINDOW_WIDTH - right_frame_width
         right_frame_y = TOP_LEFT_Y
-
         self.create_right_frame(x=right_frame_x, y=right_frame_y, width=right_frame_width, height=right_frame_height)
+
         self.refresh_list()
 
     def refresh_list(self):
-        mbot_list = findwindows.find_elements(class_name="#32770", visible_only=False)
+        mbot_list = findwindows.find_elements(class_name="#32770", visible_only=False, title_re=".*mBot.*")
         if mbot_list:
             self.mbot_list.clear()
             self.bot_name_list.delete(0, tk.END)
@@ -672,7 +745,13 @@ class MBotManager(tk.Tk):
             return
 
         mbot = self.pending_start_client[index]
-        mbot.set_delay(index%4 + 2)
+        name = mbot.get_name()
+        delay = 5
+        for i in range(len(accounts)):
+            if accounts[i]["character"] == name:
+                delay = accounts[i]["delay_time"]
+                break
+        mbot.set_delay(delay)
         mbot.save_settings()
         mbot.start_client()
 
@@ -777,6 +856,412 @@ class MBotManager(tk.Tk):
             mbot.stop_training()
             time.sleep(0.01)
 
+class Account(tk.Frame):
+    def __init__(self, master=None):
+        super().__init__(master)
+        self.mbot_file_var = tk.StringVar()
+        self.sro_folder_var = tk.StringVar()
+        self.username_entry = None
+
+        self.create_widgets()
+        self.update_listbox()
+
+    def create_widgets(self):
+        left_frame_width = WINDOW_WIDTH * 2 / 12
+        left_frame_height = WINDOW_HEIGHT
+        left_frame_x = TOP_LEFT_X
+        left_frame_y = TOP_LEFT_Y
+        self.create_left_frame(x=left_frame_x, y=left_frame_y, width=left_frame_width, height=left_frame_height)
+
+        right_frame_width = WINDOW_WIDTH - left_frame_width
+        right_frame_height = WINDOW_HEIGHT
+        right_frame_x = WINDOW_WIDTH - right_frame_width
+        right_frame_y = TOP_LEFT_Y
+        self.create_right_frame(x=right_frame_x, y=right_frame_y, width=right_frame_width, height=right_frame_height)
+
+    def create_left_frame(self, x, y, width, height):
+        frame = ttk.Frame(self)
+        frame.place(x=x, y=y, width=width, height=height)
+
+        self.create_account_list_frame(frame)
+        self.create_button_list_frame(frame)
+
+    def create_account_list_frame(self, parent_frame):
+        frame = ttk.Frame(parent_frame)
+        frame.pack(fill='x', pady=2)
+        ttk.Label(frame, text="Account").pack(anchor='w')
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.account_list = tk.Listbox(frame, selectmode=tk.EXTENDED, height=15, yscrollcommand=scrollbar.set)
+        self.account_list.pack(side=tk.LEFT, fill='both', expand=True)
+        self.account_list.bind("<<ListboxSelect>>", self.show_account)
+
+        scrollbar.config(command=self.account_list.yview)
+
+    def create_button_list_frame(self, parent_frame):
+        button_frame = ttk.Frame(parent_frame)
+        button_frame.pack(fill='x', pady=2)
+
+        ttk.Button(button_frame, text="Delete account", command=self.delete_account).pack(fill='x', pady=1)
+        ttk.Button(button_frame, text="Start mbBot & login SRO client", command=self.start_mbot_and_login_sro_selected).pack(fill='x', pady=1)
+
+    def kill_client(self, index):
+        index_real = self.pending_start_mbot[index]
+        character = accounts[index_real]["character"]
+        mbot_list = findwindows.find_elements(class_name="#32770", title=f"{character} mBot v1.12b (vSRO 110)")
+        if not mbot_list:
+            return
+        mbot = MBot(mbot_list[0])
+        mbot.set_delay()
+        mbot.kill_client()
+        mbot.log_off()
+
+        self.start_mbot_client(index+1)
+
+    def login_sro(self, index):
+        windows = findwindows.find_elements(class_name="CLIENT", title="SRO_Client")
+        if not windows:
+            return
+        
+        handle = windows[0].handle
+        ctypes.windll.user32.ShowWindow(handle, 5)
+        time.sleep(0.2)
+        ctypes.windll.user32.SetForegroundWindow(handle)
+        time.sleep(0.2)
+
+        rect = win32gui.GetWindowRect(handle)
+        left, top, right, bottom = rect
+
+        width = right - left
+        height = bottom - top
+        center_x = left + width//2
+        center_y = top + height//2
+
+        auto.Click(center_x,center_y)
+        time.sleep(0.2)
+        server_x = center_x
+        server_y = center_y - 125
+        auto.Click(server_x,server_y)
+        time.sleep(0.2)
+        choose_server_x = center_x - 50
+        choose_server_y = center_y + 200
+        auto.Click(choose_server_x,choose_server_y)
+        time.sleep(0.2)
+        index_real = self.pending_start_mbot[index]
+        username = accounts[index_real]["username"]
+        password = accounts[index_real]["password"]
+        password_decode = base64.b64decode(password).decode("utf-8")
+        auto.SendKeys('{Tab}', interval=0.05)
+        auto.SendKeys(username, interval=0.05)
+        auto.SendKeys('{Tab}', interval=0.05)
+        auto.SendKeys(password_decode, interval=0.05)
+        auto.SendKeys('{Enter}', interval=0.05)
+
+        self.after(26000, lambda: self.kill_client(index))
+
+    def start_client_sro(self, index):
+        mbot_list = findwindows.find_elements(class_name="#32770", title="mBot v1.12b (vSRO 110)")
+        if not mbot_list:
+            return
+        mbot = MBot(mbot_list[0])
+        mbot.start_client()
+        self.after(16000, lambda: self.login_sro(index))
+
+    def confirm_if_need(self, index):
+        confirmation_list = findwindows.find_elements(class_name="#32770")
+        if not confirmation_list:
+            return self.after(15000, lambda: self.start_client_sro(index))
+        for confirmation in confirmation_list:
+            children = confirmation.children()
+            for child in children:
+                if child.name == "OK":
+                    win32gui.SendMessage(child.handle, win32con.BM_CLICK, 0, 0)
+                    time.sleep(0.1)
+                    stop_loop = True
+                    break
+            if stop_loop:
+                break
+        self.after(1000, lambda: self.confirm_if_need(index))
+        
+    def start_mbot_client(self, index):
+        if index >= len(self.pending_start_mbot):
+            return
+        index_real = self.pending_start_mbot[index]
+        mbot_path = accounts[index_real]["mbot_file_path"]
+        folder_path = os.path.normpath(os.path.dirname(mbot_path))
+        subprocess.Popen(mbot_path,cwd=folder_path)
+
+        self.after(15000, lambda: self.confirm_if_need(index))
+    
+    def start_mbot_and_login_sro_selected(self):
+        selected = self.account_list.curselection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please choose one mbot")
+            return
+
+        self.pending_start_mbot = selected
+        self.start_mbot_client(0)
+
+    def create_right_frame(self, x, y, width, height):
+        frame = ttk.Frame(self)
+        frame.place(x=x, y=y, width=width, height=height)
+
+        ttk.Label(frame, text="Sign up").pack(anchor='w')
+        self.create_sign_up_frame(frame)
+        ttk.Label(frame, text="Detail").pack(anchor='w')
+        self.create_detail_frame(frame)
+
+    def create_sign_up_frame(self, parent_frame):
+        frame = ttk.Frame(parent_frame)
+        frame.pack(fill='x', pady=2)
+
+        tk.Label(frame, text="Username:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        self.username_entry = tk.Entry(frame)
+        self.username_entry.grid(row=0, column=1, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame, text="Password:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
+        self.password_entry = tk.Entry(frame, show="*")
+        self.password_entry.grid(row=0, column=3, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame, text="Delay:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
+        self.delay_entry = tk.Entry(frame)
+        self.delay_entry.grid(row=0, column=5, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame, text="Character:").grid(row=0, column=6, padx=5, pady=2, sticky="w")
+        self.character_entry = tk.Entry(frame)
+        self.character_entry.grid(row=0, column=7, padx=5, pady=2, sticky="w")
+
+        tk.Button(frame, text="Add account", command=self.add_account).grid(row=0, column=8, padx=5, pady=2, sticky="w")
+
+    def create_detail_frame(self, parent_frame):
+        frame = ttk.Frame(parent_frame)
+        frame.pack(fill='x', pady=2)
+
+        tk.Label(frame, text="Username:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        self.username_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self.username_var, state='readonly').grid(row=0, column=1, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame, text="Password:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
+        self.password_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self.password_var, show="*").grid(row=0, column=3, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame, text="Delay:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
+        self.delay_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self.delay_var).grid(row=0, column=5, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame, text="Character:").grid(row=0, column=6, padx=5, pady=2, sticky="w")
+        self.character_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self.character_var).grid(row=0, column=7, padx=5, pady=2, sticky="w")
+
+        tk.Button(frame, text="Update account", command=self.update_account).grid(row=0, column=8, padx=5, pady=2, sticky="w")
+
+        mbot_file_button = tk.Button(frame, text="Select file start mBot", command=self.select_mbot_file)
+        mbot_file_button.grid(row=1, column=0, padx=5, pady=5)
+        tk.Entry(frame, textvariable=self.mbot_file_var, state='readonly').grid(row=1, column=1, padx=5, pady=2, sticky="we", columnspan=8)
+
+        sro_folder_button = tk.Button(frame, text="   Select folder SRO   ", command=self.select_sro_folder)
+        sro_folder_button.grid(row=2, column=0, padx=5, pady=5)
+        tk.Entry(frame, textvariable=self.sro_folder_var, state='readonly').grid(row=2, column=1, padx=5, pady=2, sticky="we", columnspan=8)
+
+    def select_mbot_file(self):
+        if not self.username_var.get():
+            messagebox.showwarning("Warning", "Please choose one account")
+            return
+
+        mbot_path = filedialog.askopenfilename(
+            title="Select mBot file",
+            filetypes=[("Applications", "*.exe"), ("All files", "*.*")]
+        )
+        if mbot_path:
+            mbot_path = mbot_path.replace("/", "\\")
+            self.mbot_file_var.set(mbot_path)
+            folder_path = os.path.normpath(os.path.dirname(mbot_path))
+            for f in os.listdir(folder_path):
+                if f.strip().lower() == "config.ini":
+                    config_path = os.path.join(folder_path, f)
+                    break
+
+            if not config_path:
+                return
+
+            with open(config_path, "r", encoding="utf-16-le", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.lower().startswith("srodir="):
+                        srodir_value = line.split("=", 1)[1]
+                        self.sro_folder_var.set(srodir_value)
+                        break
+                    else:
+                        continue
+
+    def select_sro_folder(self):
+        if not self.username_var.get():
+            messagebox.showwarning("Warning", "Please choose one account")
+            return
+
+        shell = win32com.client.Dispatch("Shell.Application")
+        folder = shell.BrowseForFolder(0, "Select Folder", 0, 0)
+        if folder:
+            self.sro_folder_var.set(folder.Self.Path)
+
+    def update_listbox(self):
+        self.account_list.delete(0, tk.END)
+        for account in accounts:
+            self.account_list.insert(tk.END, account["username"])
+
+    def show_account(self, event):
+        selection = self.account_list.curselection()
+        if selection:
+            index = selection[0]
+            account = accounts[index]
+            self.username_var.set(account["username"])
+            self.password_var.set(base64.b64decode(account["password"]).decode('utf-8'))
+            self.delay_var.set(str(account.get("delay_time", 0)))
+            self.character_var.set(account["character"])
+            self.mbot_file_var.set(account["mbot_file_path"])
+            self.sro_folder_var.set(account["sro_folder_path"])
+
+    def add_account(self):
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        delay_time = self.delay_entry.get().strip()
+        character = self.character_entry.get().strip()
+
+        if not username or not password:
+            messagebox.showwarning("Input Error", "Username and password required!")
+            return
+        
+        if not character:
+            messagebox.showwarning("Input Error", "Character required!")
+            return
+
+        try:
+            delay_time_int = int(delay_time) if delay_time else 0
+        except ValueError:
+            messagebox.showwarning("Input Error", "Delay time must be an integer!")
+            return
+
+        for account in accounts:
+            if account["username"] == username:
+                messagebox.showerror("Error", "Username already exists!")
+                return
+
+        encoded_password = base64.b64encode(password.encode('utf-8')).decode('utf-8')
+        accounts.append({"username": username, "password": encoded_password, "delay_time": delay_time_int, "character": character,"mbot_file_path": "", "sro_folder_path": ""})
+        save_accounts()
+        self.update_listbox()
+        self.username_entry.delete(0, tk.END)
+        self.password_entry.delete(0, tk.END)
+        self.delay_entry.delete(0, tk.END)
+        self.character_entry.delete(0, tk.END)
+        messagebox.showinfo("Success", "Account added!")
+
+    def update_folder_sro(self):
+        sro_folder_path = self.sro_folder_var.get()
+        mbot_path = self.mbot_file_var.get()
+
+        folder_path = os.path.normpath(os.path.dirname(mbot_path))
+        config_path = None
+
+        for f in os.listdir(folder_path):
+            if f.strip().lower() == "config.ini":
+                config_path = os.path.join(folder_path, f)
+                break
+
+        if not config_path:
+            return
+        
+        with open(config_path, "r", encoding="utf-16-le", errors="ignore") as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            if line.strip().lower().startswith("srodir="):
+                lines[i] = f"srodir={sro_folder_path}\n"
+                break
+
+        with open(config_path, "w", encoding="utf-16-le") as f:
+            f.writelines(lines)
+
+    def update_account(self):
+        selection = self.account_list.curselection()
+        if not selection:
+            messagebox.showwarning("Select account", "Please select an account to update!")
+            return
+        index = selection[0]
+
+        new_password = self.password_var.get()
+        new_delay = self.delay_var.get()
+        new_character = self.character_var.get()
+        new_mbot_file_path = self.mbot_file_var.get()
+        new_sro_folder_path = self.sro_folder_var.get()
+
+        if not new_mbot_file_path or not new_sro_folder_path:
+            messagebox.showwarning("Warning", "Please select file start mBot and select folder SRO")
+            return
+        self.update_folder_sro()
+
+        try:
+            new_delay_int = int(new_delay) if new_delay else 0
+        except ValueError:
+            messagebox.showwarning("Input Error", "Delay time must be an integer!")
+            return
+
+        encoded_password = base64.b64encode(new_password.encode('utf-8')).decode('utf-8')
+        accounts[index]["password"] = encoded_password
+        accounts[index]["delay_time"] = new_delay_int
+        accounts[index]["character"] = new_character
+        accounts[index]["mbot_file_path"] = new_mbot_file_path
+        accounts[index]["sro_folder_path"] = new_sro_folder_path
+
+        save_accounts()
+        self.update_listbox()
+        messagebox.showinfo("Updated", "Account updated!")
+
+    def delete_account(self):
+        selection = self.account_list.curselection()
+        if not selection:
+            messagebox.showwarning("Select account", "Please select an account to remove!")
+            return
+        index = selection[0]
+        confirm = messagebox.askyesno("Confirm delete", f"Delete '{accounts[index]['username']}'?")
+        if confirm:
+            accounts.pop(index)
+            save_accounts()
+            self.update_listbox()
+            self.username_var.set("")
+            self.password_var.set("")
+            self.delay_var.set("")
+            self.character_var.set("")
+            self.mbot_file_var.set("")
+            self.sro_folder_var.set("")
+            messagebox.showinfo("Deleted", "Account removed!")
+
+class MBotManager(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("mBot Controller")
+        self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        self.resizable(False, False)
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(expand=True, fill='both')
+
+        self.account_page = ttk.Frame(notebook)
+        notebook.add(self.account_page, text="Account")
+
+        self.monitor_page =  ttk.Frame(notebook)
+        notebook.add(self.monitor_page, text="Monitor")
+
+    def run(self):
+        account = Account(self.account_page)
+        account.pack(expand=True, fill='both')
+        monitor = Monitor(self.monitor_page)
+        monitor.pack(expand=True, fill='both')
+
 if __name__ == "__main__":
+    accounts = load_accounts()
     app = MBotManager()
+    app.run()
     app.mainloop()
