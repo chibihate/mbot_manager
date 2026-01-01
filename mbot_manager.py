@@ -86,7 +86,7 @@ def save_accounts():
     with open(FILE_NAME, "w") as f:
         json.dump(accounts, f, indent=4)
 
-def click_confirmation(class_name="#32770", title="Confirmation", text="&Yes", is_re=False, timeout=2, retry_interval=0.1):
+def click_confirmation(class_name="#32770", title="Confirmation", text="&Yes", is_re=False, timeout=1, retry_interval=0.1):
     """
     Waits for a confirmation dialog and clicks the text button if found.
 
@@ -116,7 +116,7 @@ def click_confirmation(class_name="#32770", title="Confirmation", text="&Yes", i
                         return True
             return False
 
-        wait_and_click()
+        return wait_and_click()
     except TimeoutError:
         return False
 
@@ -1256,10 +1256,10 @@ class Account(tk.Frame):
         if not mbot_list:
             return
 
-        mbot_list = []
-        mbot_list.append(MBot(mbot_list[0]))
+        mbot_list_process = []
+        mbot_list_process.append(MBot(mbot_list[0]))
         self.process_mbots(
-            mbot_list,
+            mbot_list_process,
             actions=[
                 (0, lambda mbot: mbot.set_delay()),
                 (100, lambda mbot: mbot.save_settings()),
@@ -1355,15 +1355,26 @@ class Account(tk.Frame):
         self.after(10000, lambda: self.login_sro(index))
 
     def confirm_if_need(self, index):
-        confirm = click_confirmation(text="Electus.*", is_re=True)
-        if not confirm:
-            return self.after(2000, lambda: self.start_client_sro(index))
-        self.after(1000, lambda: self.confirm_if_need(index))
+        confirm = click_confirmation(title="Electus.*", text="OK", is_re=True)
+        if confirm:
+            self.after(1000, lambda: self.confirm_if_need(index))
+        else:
+            self.after(2000, lambda: self.start_client_sro(index))
 
     def start_mbot_client(self, index):
         if index >= len(self.pending_start_mbot):
             return
+        
         index_real = self.pending_start_mbot[index]
+        character = accounts[index_real]["character"]
+        mbot_list = findwindows.find_elements(class_name="#32770", title=f"[{character}] mBot v1.12b (vSRO 110)", visible_only=False)
+        if mbot_list:
+            return self.after(1000, lambda: self.start_mbot_client(index + 1))
+        
+        mbot_list = findwindows.find_elements(class_name="#32770", title=f"[{character} - DC] mBot v1.12b (vSRO 110)", visible_only=False)
+        if mbot_list:
+            return self.after(1000, lambda: self.start_mbot_client(index + 1))
+
         mbot_path = accounts[index_real]["mbot_file_path"]
         folder_path = os.path.normpath(os.path.dirname(mbot_path))
         subprocess.Popen(mbot_path,cwd=folder_path)
