@@ -274,7 +274,7 @@ class MBot():
         if not self.delay_edit:
             self.delay_edit = self.find_element_by_next_element("minutes before relogin")
 
-        delay = 9999
+        delay = 999
         if not is_default:
             name = self.get_name()
             for acc in accounts:
@@ -311,6 +311,7 @@ class MBot():
         if not self.start_client_button:
             self.start_client_button = self.find_element_by_name("Start Client")
 
+        print("start_client")
         win32gui.PostMessage(self.start_client_button.handle, win32con.BM_CLICK, 0, 0)
 
     def kill_client(self):
@@ -1010,7 +1011,7 @@ class Monitor(tk.Frame):
                 (0, lambda mbot: mbot.set_delay(False)),
                 (100, lambda mbot: mbot.save_settings()),
                 (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.start_client())
+                (10000, lambda mbot: mbot.start_client())
             ]
         )
 
