@@ -1,1664 +1,1819 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import win32gui
-import win32con
-import win32com.client
-from pywinauto import findwindows
-import ctypes
+"""
+mbot_manager.py — Multi-mBot window manager for Silkroad Online (vSRO 110)
+Requires: Python 3.11+, PyQt6, pywin32, pywinauto  (Windows only)
+"""
+
+import sys
 import os
+import re
 import base64
 import json
+import ctypes
 import subprocess
-import uiautomation as auto
-import re
 from collections import defaultdict
-from pywinauto.timings import always_wait_until, TimeoutError
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
 
-FILE_NAME = "accounts.json"
-accounts = None
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPalette, QPainter, QBrush
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QScrollArea,
+    QLineEdit, QCheckBox, QComboBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView, QPlainTextEdit, QMessageBox,
+    QFileDialog, QProgressBar,
+)
 
-WINDOW_WIDTH = 1200
-WINDOW_HEIGHT = 650
-TOP_LEFT_X = 0
-TOP_LEFT_Y = 0
-CHAT_BUTTON_TEXTS = ["Allchat", "PM", "Party", "Guild", "Global", "Academy", "GM", "Union", "Unique"]
-INVENTORY_OPTIONS = ["Avatar", "Fellow", "Guildstorage", "Inventory", "Pet", "Storage"]
-LOG_OPTIONS = ["Refresh", "Pieces", "Log", "Active buffs"]
+# ---------------------------------------------------------------------------
+# Qt warning suppressor — must run before QApplication
+# ---------------------------------------------------------------------------
+class _QtWarningFilter:
+    _suppress = [
+        "OleInitialize", "SetProcessDpiAwarenessContext",
+        "DPI_AWARENESS_CONTEXT", "qt.conf", "QWindowsContext",
+        "qt.qpa.window", "setHighDpiScaleFactorRoundingPolicy",
+    ]
+    def write(self, msg):
+        if sys.__stderr__ and not any(s in msg for s in self._suppress):
+            sys.__stderr__.write(msg)
+    def flush(self):
+        if sys.__stderr__:
+            sys.__stderr__.flush()
 
-tcvn3_to_unicode = {
-    # Lowercase a
-    'µ':'à', '¸':'á', '¶':'ả', '·':'ã', '¹':'ạ',
-    '¨':'ă', '»':'ằ', '¾':'ắ', '¼':'ẳ', '½':'ẵ', 'Æ':'ặ',
-    '©':'â', 'Ç':'ầ', 'Ê':'ấ', 'È':'ẩ', 'É':'ẫ', 'Ë':'ậ',
+sys.stderr = _QtWarningFilter()
 
-    # Lowercase d
+# ---------------------------------------------------------------------------
+# Win32 lazy-init — no-op stubs when not on Windows
+# ---------------------------------------------------------------------------
+WIN32_AVAILABLE = False
+win32gui = win32con = win32com = win32process = None
+findwindows = always_wait_until = PWTimeoutError = auto = None
+
+
+def init_win32_modules() -> bool:
+    global WIN32_AVAILABLE, win32gui, win32con, win32com, win32process
+    global findwindows, always_wait_until, PWTimeoutError, auto
+    if WIN32_AVAILABLE:
+        return True
+    try:
+        import sys as _sys
+        import warnings as _w
+        _sys.coinit_flags = 2
+        _w.filterwarnings("ignore", message="Apply externally defined coinit_flags*")
+
+        import win32gui as _g, win32con as _c, win32com.client as _com, win32process as _p
+        from pywinauto import findwindows as _fw
+        from pywinauto.timings import always_wait_until as _awu, TimeoutError as _te
+        import uiautomation as _a
+
+        win32gui, win32con, win32com, win32process = _g, _c, _com, _p
+        findwindows, always_wait_until, PWTimeoutError, auto = _fw, _awu, _te, _a
+        WIN32_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Theme tokens
+# ---------------------------------------------------------------------------
+DARK = {
+    "bg_window":    "#1f1f22", "bg_panel":  "#26262a", "bg_deep":  "#161618",
+    "bg_input":     "#1a1a1d", "bg_hover":  "#2e2e33", "bg_active":"#34343a",
+    "bg_titlebar":  "#1a1a1d",
+    "border":       "#36363c", "border_light":"#2a2a2f",
+    "text":         "#d4d4d8", "text_dim":  "#8a8a92", "text_mute":"#5f5f67",
+    "accent":       "#5f8edf", "accent_hover":"#7aa3e6","accent_dim":"#3d5a8d",
+    "danger":       "#d35d5d", "success":   "#6dc28a", "warn":     "#d6b35a",
+    "hp":           "#d35d5d", "mp":        "#5f8edf",
+}
+T = DARK  # shorthand alias
+
+
+def make_stylesheet(t: dict) -> str:
+    return f"""
+        QMainWindow, QWidget {{
+            background:{t['bg_window']}; color:{t['text']};
+            font-family:"Segoe UI","Helvetica Neue",system-ui,sans-serif; font-size:12px;
+        }}
+        QFrame#TitleBar {{ background:{t['bg_titlebar']}; border-bottom:1px solid {t['border']}; }}
+        QFrame#Sidebar  {{ background:{t['bg_deep']};     border-right:1px solid {t['border']};  }}
+        QPushButton#NavItem {{
+            background:transparent; color:{t['text_dim']}; border:none;
+            border-left:2px solid transparent; padding:12px 4px; text-align:center;
+        }}
+        QPushButton#NavItem:hover  {{ background:{t['bg_hover']};  color:{t['text']};  }}
+        QPushButton#NavItem[active="true"] {{
+            background:{t['bg_panel']}; color:{t['text']}; border-left:2px solid {t['accent']};
+        }}
+        QFrame#Col {{ background:{t['bg_window']}; border-right:1px solid {t['border']}; }}
+        QLabel#ColHeader {{
+            background:{t['bg_deep']}; color:{t['text_dim']}; border-bottom:1px solid {t['border']};
+            padding:8px 12px; font-size:11px; font-weight:600; letter-spacing:0.5px;
+        }}
+        QLabel#Pill {{
+            background:{t['bg_input']}; border:1px solid {t['border']}; border-radius:8px;
+            padding:1px 6px; color:{t['text_dim']}; font-size:10px;
+        }}
+        QLabel#PanelTitle  {{ font-size:14px; font-weight:600; color:{t['text']};     }}
+        QLabel#PanelSub    {{ font-size:11px;                  color:{t['text_dim']}; }}
+        QLabel#SectionLabel {{ color:{t['text_mute']}; font-size:10px; font-weight:600; letter-spacing:0.5px; }}
+        QFrame#MbotRow {{
+            background:{t['bg_input']}; border:1px solid {t['border_light']}; border-radius:3px;
+        }}
+        QFrame#MbotRow[selected="true"] {{ background:{t['bg_hover']};  border:1px solid {t['accent']};     }}
+        QFrame#MbotRow[focused="true"]  {{ background:{t['bg_active']}; border:1px solid {t['accent']};     }}
+        QFrame#MbotRow:hover            {{                               border:1px solid {t['accent_dim']}; }}
+        QFrame#CharCard, QFrame#SignupCard {{
+            background:{t['bg_input']}; border:1px solid {t['border_light']}; border-radius:3px;
+        }}
+        QFrame#SignupCard {{ background:{t['bg_deep']}; border:1px solid {t['border']}; }}
+        QPushButton {{
+            background:{t['bg_panel']}; border:1px solid {t['border']};
+            border-radius:2px; color:{t['text']}; padding:6px 10px;
+        }}
+        QPushButton:hover    {{ background:{t['bg_hover']};  border:1px solid {t['accent_dim']}; }}
+        QPushButton:pressed  {{ background:{t['bg_active']}; }}
+        QPushButton:disabled {{ color:{t['text_mute']}; }}
+        QPushButton[primary="true"] {{
+            background:{t['accent']};       border:1px solid {t['accent']};       color:white;
+        }}
+        QPushButton[primary="true"]:hover {{
+            background:{t['accent_hover']}; border:1px solid {t['accent_hover']};
+        }}
+        QPushButton[danger="true"]:hover {{ border:1px solid {t['danger']}; color:{t['danger']}; }}
+        QPushButton#ChatTab {{
+            background:{t['bg_panel']}; border:1px solid {t['border']}; color:{t['text_dim']}; padding:4px 10px;
+        }}
+        QPushButton#ChatTab[active="true"] {{
+            background:{t['accent']}; border:1px solid {t['accent']}; color:white;
+        }}
+        QLineEdit, QComboBox, QPlainTextEdit {{
+            background:{t['bg_input']}; border:1px solid {t['border']}; border-radius:2px;
+            color:{t['text']}; padding:4px 8px; selection-background-color:{t['accent']};
+        }}
+        QLineEdit:focus, QComboBox:focus {{ border:1px solid {t['accent']}; }}
+        QComboBox::drop-down {{ border:none; width:18px; }}
+        QCheckBox {{ color:{t['text']}; spacing:5px; }}
+        QCheckBox::indicator {{
+            width:13px; height:13px; border:1px solid {t['border']};
+            background:{t['bg_input']}; border-radius:2px;
+        }}
+        QCheckBox::indicator:checked {{ background:{t['accent']}; border:1px solid {t['accent']}; image:none; }}
+        QTableWidget {{
+            background:{t['bg_deep']}; border:1px solid {t['border']};
+            gridline-color:{t['border_light']}; color:{t['text']};
+        }}
+        QHeaderView::section {{
+            background:{t['bg_panel']}; color:{t['text_dim']}; border:none;
+            border-right:1px solid {t['border']}; border-bottom:1px solid {t['border']};
+            padding:6px 10px; font-weight:600; font-size:10px; letter-spacing:0.5px;
+        }}
+        QTableWidget::item          {{ padding:6px 10px; }}
+        QTableWidget::item:hover    {{ background:{t['bg_hover']}; }}
+        QTableWidget::item:selected {{ background:{t['bg_active']}; color:{t['text']}; }}
+        QTableWidget::item:checked  {{ background:{t['bg_active']}; border-left:2px solid {t['accent']}; }}
+        QTableWidget::indicator {{
+            width:14px; height:14px; border:1px solid {t['border_light']};
+            border-radius:2px; background:{t['bg_input']};
+        }}
+        QTableWidget::indicator:checked       {{ background:{t['accent']};    border-color:{t['accent']};     image:none; }}
+        QTableWidget::indicator:unchecked:hover {{ border-color:{t['accent_dim']}; }}
+        QScrollBar:vertical, QScrollBar:horizontal {{
+            background:{t['bg_deep']}; width:12px; height:12px;
+        }}
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+            background:{t['border']}; border-radius:4px; min-height:20px; min-width:20px;
+        }}
+        QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+            background:{t['text_mute']};
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ background:none; height:0; width:0; }}
+        QProgressBar {{
+            background:{t['bg_deep']}; border:1px solid {t['border']}; border-radius:2px;
+            height:10px; text-align:center; color:{t['text']}; font-size:9px;
+        }}
+        QProgressBar#HP::chunk {{ background:{t['hp']}; }}
+        QProgressBar#MP::chunk {{ background:{t['mp']}; }}
+        QProgressBar#XP::chunk {{ background:{t['accent']}; }}
+        QPlainTextEdit#Log, QPlainTextEdit#ChatStream, QPlainTextEdit#InvLog {{
+            background:{t['bg_deep']}; color:{t['text']};
+            font-family:"JetBrains Mono","Consolas",monospace; font-size:11px;
+        }}
+    """
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+@dataclass
+class MbotInfo:
+    """UI snapshot of one live mBot window."""
+    id: int
+    window_name: str
+    char: str
+    is_dc: bool
+    hp: float = 0.0
+    mp: float = 0.0
+    kph: str = "–"
+
+    @property
+    def status(self) -> str:
+        return "offline" if self.is_dc else "training"
+
+
+def _parse_char_name(title: str) -> tuple[str, bool]:
+    is_dc = "- DC" in title
+    m = re.search(r"\[(.+?)(?:\s+-\s+DC)?\]", title)
+    return (m.group(1) if m else title), is_dc
+
+
+# Global live state
+_live_windows: list = []
+_live_mbots:   list[MbotInfo] = []
+
+
+def now_ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ACCOUNTS_FILE       = "accounts.json"
+CHAT_BUTTON_TEXTS   = ["Allchat","PM","Party","Guild","Global","Academy","GM","Union","Unique"]
+INVENTORY_OPTIONS   = ["Avatar","Fellow","Guildstorage","Inventory","Pet","Storage"]
+
+# ---------------------------------------------------------------------------
+# TCVN3 → Unicode lookup
+# ---------------------------------------------------------------------------
+TCVN3_TO_UNICODE: dict[str, str] = {
+    'µ':'à','¸':'á','¶':'ả','·':'ã','¹':'ạ',
+    '¨':'ă','»':'ằ','¾':'ắ','¼':'ẳ','½':'ẵ','Æ':'ặ',
+    '©':'â','Ç':'ầ','Ê':'ấ','È':'ẩ','É':'ẫ','Ë':'ậ',
     '®':'đ',
-
-    # Lowercase e
-    'Ì':'è', 'Ð':'é', 'Î':'ẻ', 'Ï':'ẽ', 'Ñ':'ẹ',
-    'ª':'ê', 'Ò':'ề', 'Õ':'ế', 'Ó':'ể', 'Ô':'ễ', 'Ö':'ệ',
-
-    # Lowercase i
-    '×':'ì', 'Ý':'í', 'Ø':'ỉ', 'Ü':'ĩ', 'Þ':'ị',
-
-    # Lowercase o
-    'ß':'ò', 'ã':'ó', 'á':'ỏ', 'â':'õ', 'ä':'ọ',
-    '«':'ô', 'å':'ồ', 'è':'ố', 'æ':'ổ', 'ç':'ỗ', 'é':'ộ',
-    '¬':'ơ', 'ê':'ờ', 'í':'ớ', 'ë':'ở', 'ì':'ỡ', 'î':'ợ',
-
-    # Lowercase u
-    'ï':'ù', 'ó':'ú', 'ñ':'ủ', 'ò':'ũ', 'ô':'ụ',
-    '­':'ư', 'õ':'ừ', 'ø':'ứ', 'ö':'ử', '÷':'ữ', 'ù':'ự',
-
-    # Lowercase y
-    'ú':'ỳ', 'ý':'ý', 'û':'ỷ', 'ü':'ỹ', 'þ':'ỵ',
-
-    # Uppercase D
-    "§": "Đ",
-
-    # Uppercase E
-    "£": "Ê",
-
-    # Upper case O
-    "¤": "Ô", "¥": "Ơ",
-
-    # Upper case U
-    "¦": "Ư"
+    'Ì':'è','Ð':'é','Î':'ẻ','Ï':'ẽ','Ñ':'ẹ',
+    'ª':'ê','Ò':'ề','Õ':'ế','Ó':'ể','Ô':'ễ','Ö':'ệ',
+    '×':'ì','Ý':'í','Ø':'ỉ','Ü':'ĩ','Þ':'ị',
+    'ß':'ò','ã':'ó','á':'ỏ','â':'õ','ä':'ọ',
+    '«':'ô','å':'ồ','è':'ố','æ':'ổ','ç':'ỗ','é':'ộ',
+    '¬':'ơ','ê':'ờ','í':'ớ','ë':'ở','ì':'ỡ','î':'ợ',
+    'ï':'ù','ó':'ú','ñ':'ủ','ò':'ũ','ô':'ụ',
+    '­':'ư','õ':'ừ','ø':'ứ','ö':'ử','÷':'ữ','ù':'ự',
+    'ú':'ỳ','ý':'ý','û':'ỷ','ü':'ỹ','þ':'ỵ',
+    '§':'Đ','£':'Ê','¤':'Ô','¥':'Ơ','¦':'Ư',
 }
 
-def tcvn3_to_unicode_text(text):
-    """Convert TCVN3 text to Unicode."""
-    return ''.join(tcvn3_to_unicode.get(char, char) for char in text)
+def tcvn3_to_unicode_text(text: str) -> str:
+    return ''.join(TCVN3_TO_UNICODE.get(ch, ch) for ch in text)
 
-def extract_progress_bar(num_string):
-    parts = num_string.split("/")
-    current = int(parts[0].replace(",", "").strip())
-    total = int(parts[1].replace(",", "").strip())
-    return current * 100 / total
 
-def load_accounts():
-    if os.path.exists(FILE_NAME):
-        with open(FILE_NAME, "r") as f:
+# ---------------------------------------------------------------------------
+# Account persistence
+# ---------------------------------------------------------------------------
+_accounts: list = []
+
+
+def load_accounts() -> list:
+    if os.path.exists(ACCOUNTS_FILE):
+        with open(ACCOUNTS_FILE, "r") as f:
             return json.load(f)
     return []
 
-def save_accounts():
-    with open(FILE_NAME, "w") as f:
-        json.dump(accounts, f, indent=4)
 
-def click_confirmation(class_name="#32770", title="Confirmation", text="&Yes", is_re=False, timeout=1, retry_interval=0.1):
-    """
-    Waits for a confirmation dialog and clicks the text button if found.
+def save_accounts() -> None:
+    with open(ACCOUNTS_FILE, "w") as f:
+        json.dump(_accounts, f, indent=4)
 
-    Args:
-        class: Class to match
-        title (str): Dialog title to match.
-        text (str): Text of the button (default "&Yes" for standard Windows dialogs).
-        is_re(bool): True if we want to search regular expression
-        timeout (float): Max time to wait for the dialog.
-        retry_interval (float): How often to check for the dialog.
 
-    Returns:
-        bool: True if Yes button was clicked, False if timed out or not found.
-    """
+# ---------------------------------------------------------------------------
+# Win32 helpers
+# ---------------------------------------------------------------------------
+def extract_progress_bar(num_string: str) -> float:
+    try:
+        cur, tot = num_string.split("/")
+        c = int(cur.replace(",","").strip()); t = int(tot.replace(",","").strip())
+        return c * 100 / t if t else 0
+    except Exception:
+        return 0
+
+
+def click_confirmation(
+    class_name: str = "#32770", title: str = "Confirmation",
+    text: str = "&Yes", is_re: bool = False,
+    timeout: float = 1, retry_interval: float = 0.1,
+) -> bool:
+    if not WIN32_AVAILABLE:
+        return False
     try:
         @always_wait_until(timeout, retry_interval)
-        def wait_and_click():
-            if is_re:
-                confirmation_list = findwindows.find_elements(class_name=class_name, title_re=title)
-            else:
-                confirmation_list = findwindows.find_elements(class_name=class_name, title=title)
-            for confirmation in confirmation_list:
-                children = confirmation.children()
-                for child in children:
+        def _wait():
+            els = (findwindows.find_elements(class_name=class_name, title_re=title)
+                   if is_re else
+                   findwindows.find_elements(class_name=class_name, title=title))
+            for el in els:
+                for child in el.children():
                     if child.name == text:
                         win32gui.SendMessage(child.handle, win32con.BM_CLICK, 0, 0)
                         return True
             return False
-
-        return wait_and_click()
-    except TimeoutError:
+        return _wait()
+    except PWTimeoutError:
         return False
 
-class MBot():
-    def __init__(self, mbot):
-        self.mbot = mbot
-        self.delay_edit = None
-        self.save_settings_button = None
-        self.log_off_button = None
-        self.start_client_button = None
-        self.kill_client_button = None
-        self.show_hide_client_button = None
-        self.reset_section = None
-        self.stats_section = None
-        self.hp_value = None
-        self.mp_value = None
-        self.name = ""
-        self.current_position_button = None
-        self.start_training_button = None
-        self.stop_training_button = None
-        self.inventory_combo = None
-        self.inventory_refresh_button = None
-        self.inventory_items = None
-        self.clear_button = None
-        self.log_edit = None
-        self.drops_checkbox_state = None
-        self.who_attacked_you_checkbox_state = None
-        self.spy_player_checkbox_state = None
-        self.refresh_spy_button = None
-        self.spy_combo = None
-        self.spy_log = None
-        self.chat_buttons_dict = {}
 
-    def __str__(self):
-        return f"name: {self.mbot.name}"
+# ---------------------------------------------------------------------------
+# MBotWindow — wraps one live mBot window; all Win32 calls live here
+# ---------------------------------------------------------------------------
+class MBotWindow:
+    def __init__(self, element):
+        self.mbot = element
+        self.name: str = ""
+        # Cached element references (populated lazily)
+        self._delay_edit         = None
+        self._save_settings_btn  = None
+        self._log_off_btn        = None
+        self._start_client_btn   = None
+        self._kill_client_btn    = None
+        self._show_hide_cli_btn  = None
+        self._reset_btn          = None
+        self._stats_section      = None
+        self._hp_value           = None
+        self._mp_value           = None
+        self._cur_pos_btn        = None
+        self._start_train_btn    = None
+        self._stop_train_btn     = None
+        self._inv_combo          = None
+        self._inv_refresh_btn    = None
+        self._inv_items          = None
+        self._clear_btn          = None
+        self._log_edit           = None
+        self._drops_cb           = None
+        self._who_atk_cb         = None
+        self._spy_player_cb      = None
+        self._spy_refresh_btn    = None
+        self._spy_combo          = None
+        self._spy_log            = None
+        self._chat_buttons: dict = {}
 
-    def is_valid(self):
-        return win32gui.IsWindow(self.mbot.handle)
+    def __str__(self): return f"MBotWindow({self.mbot.name})"
 
-    def find_element_by_name(self, name):
-        if not self.is_valid():
-            return
+    def is_valid(self) -> bool:
+        return WIN32_AVAILABLE and win32gui.IsWindow(self.mbot.handle)
 
-        children = self.mbot.children()
-        for child in children:
-            if child.name == name:
-                return child
+    def _children(self):
+        return self.mbot.children()
 
-    def find_element_by_next_element(self, name):
-        if not self.is_valid():
-            return
+    # ── Element lookup helpers ────────────────────────────────────────────
+    def _find_by_name(self, name):
+        if not self.is_valid(): return None
+        return next((c for c in self._children() if c.name == name), None)
 
-        children = self.mbot.children()
+    def _find_after(self, name):
+        """Return the element immediately preceding a given name."""
+        if not self.is_valid(): return None
+        children = self._children()
         for i, child in enumerate(children):
-            next_child = children[i + 1] if i + 1 < len(children) else None
-            if next_child.name == name:
+            nxt = children[i+1] if i+1 < len(children) else None
+            if nxt and nxt.name == name:
                 return child
+        return None
 
-    def find_nth_element_by_name(self, name, index):
-        if not self.is_valid():
-            return
-
-        children = self.mbot.children()
+    def _find_nth(self, name, offset):
+        """Return the element at (index_of_name + offset)."""
+        if not self.is_valid(): return None
+        children = self._children()
         for i, child in enumerate(children):
-            nth_child = children[i + index] if i + index < len(children) else None
             if child.name == name:
-                return nth_child
+                idx = i + offset
+                return children[idx] if idx < len(children) else None
+        return None
 
-    def get_hp(self):
-        if not self.is_valid():
-            return
+    # ── Stats ─────────────────────────────────────────────────────────────
+    def get_hp(self) -> float | None:
+        if not self.is_valid(): return None
+        self._hp_value = self._hp_value or self._find_nth("HP", 6)
+        return extract_progress_bar(self._hp_value.name) if self._hp_value else None
 
-        if not self.hp_value:
-            self.hp_value = self.find_nth_element_by_name("HP", 6)
+    def get_mp(self) -> float | None:
+        if not self.is_valid(): return None
+        self._mp_value = self._mp_value or self._find_nth("MP", 6)
+        return extract_progress_bar(self._mp_value.name) if self._mp_value else None
 
-        return extract_progress_bar(self.hp_value.name)
-
-    def get_mp(self):
-        if not self.is_valid():
-            return
-
-        if not self.mp_value:
-            self.mp_value = self.find_nth_element_by_name("MP", 6)
-
-        return extract_progress_bar(self.mp_value.name)
-
-    def get_name(self):
-        if not self.is_valid():
-            return
-
-        if self.name == "":
-            element = self.find_nth_element_by_name("Hide client after relogin", 1)
-            name = element.name
-            split_name = name.split(":")
-            if len(split_name) > 1 and split_name[0] == "Name":
-                self.name = split_name[1].strip()
+    def get_name(self) -> str:
+        if not self.is_valid(): return self.mbot.name
+        if not self.name:
+            el = self._find_nth("Hide client after relogin", 1)
+            if el:
+                parts = el.name.split(":")
+                self.name = parts[1].strip() if len(parts) > 1 and parts[0] == "Name" else parts[0].strip()
             else:
-                self.name = split_name[0].strip()
+                self.name = self.mbot.name
         return self.name
 
-    def get_stats(self):
-        if not self.is_valid():
-            return
-
-        if not self.stats_section:
-            self.stats_section = self.find_nth_element_by_name("Stop training", 2)
-
-        return self.stats_section.name
-
-    def get_kills_per_hour(self):
-        if not self.is_valid():
-            return
-
-        text = self.get_stats()
-        sections = text.split("\n\n")
-        for sec in sections:
-            if sec.startswith("Per hour"):
-                per_hour_section = sec
-                break
-
-        for line in per_hour_section.splitlines():
+    def get_kills_per_hour(self) -> str:
+        self._stats_section = self._stats_section or self._find_nth("Stop training", 2)
+        if not self._stats_section:
+            return "–"
+        text = self._stats_section.name
+        section = next((s for s in text.split("\n\n") if s.startswith("Per hour")), "")
+        for line in section.splitlines():
             if line.startswith("Kills:"):
-                kills_per_hour = line.split(":")[1].strip()
-                kills_per_hour = kills_per_hour.split(".")[0].strip()
-                break
-        return f"K/H: {kills_per_hour}"
+                return line.split(":")[1].strip().split(".")[0].strip()
+        return "–"
 
-    def get_edit_content(self, handle):
-        if not self.is_valid():
-            return
-
+    # ── Text read helper ──────────────────────────────────────────────────
+    def _get_edit_content(self, handle) -> str:
+        if not WIN32_AVAILABLE: return ""
         length = win32gui.SendMessage(handle, win32con.WM_GETTEXTLENGTH, 0, 0)
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        win32gui.SendMessage(handle, win32con.WM_GETTEXT, length + 1, buffer)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        win32gui.SendMessage(handle, win32con.WM_GETTEXT, length + 1, buf)
+        return tcvn3_to_unicode_text("\n".join(buf.value.splitlines()[-100:]))
 
-        full_text = buffer.value
-        lines = full_text.splitlines()
-        last_100 = "\n".join(lines[-100:])
-        content = tcvn3_to_unicode_text(last_100)
-        return content
+    def get_chat_content(self, button_name: str) -> str | None:
+        if not self.is_valid(): return None
+        if button_name not in self._chat_buttons:
+            offset = CHAT_BUTTON_TEXTS.index(button_name) + 1
+            self._chat_buttons[button_name] = self._find_nth("Use colored chat", offset)
+        btn = self._chat_buttons.get(button_name)
+        return self._get_edit_content(btn.handle) if btn else None
 
-    def get_chat_content(self, button_name):
-        if not self.is_valid():
-            return
+    # ── Settings ──────────────────────────────────────────────────────────
+    def set_delay(self, _is_default: bool = True) -> None:
+        if not self.is_valid(): return
+        self._delay_edit = self._delay_edit or self._find_after("minutes before relogin")
+        if not self._delay_edit: return
+        h = self._delay_edit.handle
+        win32gui.SendMessage(h, win32con.WM_SETTEXT, 0, "")
+        win32gui.SendMessage(h, win32con.WM_SETTEXT, 0, "999")
 
-        keyword = "Use colored chat"
-        if button_name not in self.chat_buttons_dict:
-            self.chat_buttons_dict[button_name] = self.find_nth_element_by_name(keyword, CHAT_BUTTON_TEXTS.index(button_name)+1)
-        return self.get_edit_content(self.chat_buttons_dict[button_name].handle)
+    def save_settings(self) -> None:
+        if not self.is_valid(): return
+        self._save_settings_btn = self._save_settings_btn or self._find_by_name("Save settings")
+        if self._save_settings_btn:
+            win32gui.SendMessage(self._save_settings_btn.handle, win32con.BM_CLICK, 0, 0)
 
-    def set_delay(self, is_default = True):
-        if not self.is_valid():
-            return
+    # ── Window controls ───────────────────────────────────────────────────
+    def log_off(self) -> None:
+        if not self.is_valid(): return
+        self._log_off_btn = self._log_off_btn or self._find_by_name("Log Off")
+        if self._log_off_btn:
+            win32gui.PostMessage(self._log_off_btn.handle, win32con.BM_CLICK, 0, 0)
+            click_confirmation()
 
-        if not self.delay_edit:
-            self.delay_edit = self.find_element_by_next_element("minutes before relogin")
+    def start_client(self) -> None:
+        if not self.is_valid(): return
+        self._start_client_btn = self._start_client_btn or self._find_by_name("Start Client")
+        if self._start_client_btn:
+            win32gui.PostMessage(self._start_client_btn.handle, win32con.BM_CLICK, 0, 0)
 
-        delay = 999
-        if not is_default:
-            name = self.get_name()
-            for acc in accounts:
-                if acc["character"] == name:
-                    delay = acc["delay_time"]
-                    break
+    def kill_client(self) -> None:
+        if not self.is_valid(): return
+        self._kill_client_btn = self._kill_client_btn or self._find_by_name("Kill Client")
+        if self._kill_client_btn:
+            win32gui.PostMessage(self._kill_client_btn.handle, win32con.BM_CLICK, 0, 0)
+            click_confirmation()
 
-        win32gui.SendMessage(self.delay_edit.handle, win32con.WM_SETTEXT, 0, "")
-        win32gui.SendMessage(self.delay_edit.handle, win32con.WM_SETTEXT, 0, str(delay))
-
-    def save_settings(self):
-        if not self.is_valid():
-            return
-
-        if not self.save_settings_button:
-            self.save_settings_button = self.find_element_by_name("Save settings")
-
-        win32gui.SendMessage(self.save_settings_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def log_off(self):
-        if not self.is_valid():
-            return
-
-        if not self.log_off_button:
-            self.log_off_button = self.find_element_by_name("Log Off")
-
-        win32gui.PostMessage(self.log_off_button.handle, win32con.BM_CLICK, 0, 0)
-        click_confirmation()
-
-    def start_client(self):
-        if not self.is_valid():
-            return
-
-        if not self.start_client_button:
-            self.start_client_button = self.find_element_by_name("Start Client")
-
-        print("start_client")
-        win32gui.PostMessage(self.start_client_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def kill_client(self):
-        if not self.is_valid():
-            return
-
-        if not self.kill_client_button:
-            self.kill_client_button = self.find_element_by_name("Kill Client")
-
-        win32gui.PostMessage(self.kill_client_button.handle, win32con.BM_CLICK, 0, 0)
-        click_confirmation()
-
-    def kill_mbot(self):
-        if not self.is_valid():
-            return
-
+    def kill_mbot(self) -> None:
+        if not self.is_valid(): return
         win32gui.PostMessage(self.mbot.handle, win32con.WM_CLOSE, 0, 0)
         click_confirmation()
 
-    def show_hide_mbot(self):
-        if not self.is_valid():
-            return
+    def show_hide_mbot(self) -> None:
+        if not self.is_valid(): return
+        h = self.mbot.handle
+        flag = 0 if win32gui.IsWindowVisible(h) else 5
+        ctypes.windll.user32.ShowWindow(h, flag)
 
-        if win32gui.IsWindowVisible(self.mbot.handle):
-            ctypes.windll.user32.ShowWindow(self.mbot.handle, 0)
-        else:
-            ctypes.windll.user32.ShowWindow(self.mbot.handle, 5)
+    def show_hide_client(self) -> None:
+        if not self.is_valid(): return
+        self._show_hide_cli_btn = self._show_hide_cli_btn or self._find_by_name("Show / Hide Client")
+        if self._show_hide_cli_btn:
+            win32gui.PostMessage(self._show_hide_cli_btn.handle, win32con.BM_CLICK, 0, 0)
 
-    def show_hide_client(self):
-        if not self.is_valid():
-            return
+    def reset_mbot(self) -> None:
+        if not self.is_valid(): return
+        self._reset_btn = self._reset_btn or self._find_by_name("Reset")
+        if self._reset_btn:
+            win32gui.PostMessage(self._reset_btn.handle, win32con.BM_CLICK, 0, 0)
 
-        if not self.show_hide_client_button:
-            self.show_hide_client_button = self.find_element_by_name("Show / Hide Client")
+    def get_current_position(self) -> None:
+        if not self.is_valid(): return
+        self._cur_pos_btn = self._cur_pos_btn or self._find_by_name("Get current position")
+        if self._cur_pos_btn:
+            win32gui.PostMessage(self._cur_pos_btn.handle, win32con.BM_CLICK, 0, 0)
 
-        win32gui.PostMessage(self.show_hide_client_button.handle, win32con.BM_CLICK, 0, 0)
+    def start_training(self) -> None:
+        if not self.is_valid(): return
+        self._start_train_btn = self._start_train_btn or self._find_by_name("Start training")
+        if self._start_train_btn:
+            win32gui.PostMessage(self._start_train_btn.handle, win32con.BM_CLICK, 0, 0)
 
-    def reset_mbot(self):
-        if not self.is_valid():
-            return
+    def stop_training(self) -> None:
+        if not self.is_valid(): return
+        self._stop_train_btn = self._stop_train_btn or self._find_by_name("Stop training")
+        if self._stop_train_btn:
+            win32gui.PostMessage(self._stop_train_btn.handle, win32con.BM_CLICK, 0, 0)
 
-        if not self.reset_section:
-            self.reset_section = self.find_element_by_name("Reset")
+    # ── Inventory ─────────────────────────────────────────────────────────
+    def set_inventory_combo(self, index: int) -> None:
+        if not self.is_valid(): return
+        self._inv_combo = self._inv_combo or self._find_nth("Inventory", 1)
+        if self._inv_combo:
+            win32gui.SendMessage(self._inv_combo.handle, win32con.CB_SETCURSEL, index, 0)
 
-        win32gui.PostMessage(self.reset_section.handle, win32con.BM_CLICK, 0, 0)
+    def refresh_inventory(self) -> None:
+        if not self.is_valid(): return
+        self._inv_refresh_btn = self._inv_refresh_btn or self._find_nth("Inventory", 2)
+        if self._inv_refresh_btn:
+            win32gui.PostMessage(self._inv_refresh_btn.handle, win32con.BM_CLICK, 0, 0)
 
-    def get_current_position(self):
-        if not self.is_valid():
-            return
-
-        if not self.current_position_button:
-            self.current_position_button = self.find_element_by_name("Get current position")
-
-        win32gui.PostMessage(self.current_position_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def start_training(self):
-        if not self.is_valid():
-            return
-
-        if not self.start_training_button:
-            self.start_training_button = self.find_element_by_name("Start training")
-
-        win32gui.PostMessage(self.start_training_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def stop_training(self):
-        if not self.is_valid():
-            return
-
-        if not self.stop_training_button:
-            self.stop_training_button = self.find_element_by_name("Stop training")
-
-        win32gui.PostMessage(self.stop_training_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def set_inventory_combo(self, index):
-        if not self.is_valid():
-            return
-
-        if not self.inventory_combo:
-            self.inventory_combo = self.find_nth_element_by_name("Inventory", 1)
-
-        win32gui.SendMessage(self.inventory_combo.handle, win32con.CB_SETCURSEL, index, 0)
-
-    def refresh_inventory(self):
-        if not self.is_valid():
-            return
-
-        if not self.inventory_refresh_button:
-            self.inventory_refresh_button = self.find_nth_element_by_name("Inventory", 2)
-
-        win32gui.PostMessage(self.inventory_refresh_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def get_inventory_items(self):
-        if not self.is_valid():
-            return
-
-        if not self.inventory_items:
-            self.inventory_items = self.find_nth_element_by_name("Inventory", 3)
-
-        count = win32gui.SendMessage(self.inventory_items.handle, win32con.LB_GETCOUNT, 0, 0)
-        if count <= 0:
-            return []
-
+    def get_inventory_items(self) -> list[str]:
+        if not self.is_valid(): return []
+        self._inv_items = self._inv_items or self._find_nth("Inventory", 3)
+        if not self._inv_items: return []
+        h = self._inv_items.handle
+        count = win32gui.SendMessage(h, win32con.LB_GETCOUNT, 0, 0)
+        if count <= 0: return []
         items = []
         for i in range(count):
-            length = win32gui.SendMessage(self.inventory_items.handle, win32con.LB_GETTEXTLEN, i, 0)
-            if length <= 0:
-                continue
-
-            buffer = ctypes.create_unicode_buffer(length + 1)
-            win32gui.SendMessage(self.inventory_items.handle, win32con.LB_GETTEXT, i, buffer)
-
-            text = buffer.value
-            text_convert = tcvn3_to_unicode_text(text)
-            items.append(text_convert)
+            length = win32gui.SendMessage(h, win32con.LB_GETTEXTLEN, i, 0)
+            if length <= 0: continue
+            buf = ctypes.create_unicode_buffer(length + 1)
+            win32gui.SendMessage(h, win32con.LB_GETTEXT, i, buf)
+            items.append(tcvn3_to_unicode_text(buf.value))
         return items
 
-    def get_log(self):
-        if not self.is_valid():
-            return
+    # ── Log ───────────────────────────────────────────────────────────────
+    def get_log(self) -> str | None:
+        if not self.is_valid(): return None
+        self._log_edit = self._log_edit or self._find_nth("Weaponswitch", 1)
+        return self._get_edit_content(self._log_edit.handle) if self._log_edit else None
 
-        if not self.log_edit:
-            self.log_edit = self.find_nth_element_by_name("Weaponswitch", 1)
+    def clear_log(self) -> None:
+        if not self.is_valid(): return
+        self._clear_btn = self._clear_btn or self._find_by_name("Clear")
+        if self._clear_btn:
+            win32gui.PostMessage(self._clear_btn.handle, win32con.BM_CLICK, 0, 0)
 
-        return self.get_edit_content(self.log_edit.handle)
+    # ── Checkboxes ────────────────────────────────────────────────────────
+    def _get_cb(self, handle) -> bool:
+        return win32gui.SendMessage(handle, win32con.BM_GETCHECK, 0, 0) == win32con.BST_CHECKED
 
-    def clear_log(self):
-        if not self.is_valid():
-            return
+    def _set_cb(self, handle, desired: bool) -> None:
+        if self._get_cb(handle) != desired:
+            win32gui.PostMessage(handle, win32con.BM_CLICK, 0, 0)
 
-        if not self.clear_button:
-            self.clear_button = self.find_element_by_name("Clear")
+    def get_drops_checkbox_state(self) -> bool:
+        if not self.is_valid(): return False
+        self._drops_cb = self._drops_cb or self._find_by_name("Drops")
+        return self._get_cb(self._drops_cb.handle) if self._drops_cb else False
 
-        win32gui.PostMessage(self.clear_button.handle, win32con.BM_CLICK, 0, 0)
+    def set_drops_checkbox_state(self, desired: bool) -> None:
+        if not self.is_valid(): return
+        self._drops_cb = self._drops_cb or self._find_by_name("Drops")
+        if self._drops_cb: self._set_cb(self._drops_cb.handle, desired)
 
-    def get_drops_checkbox_state(self):
-        if not self.is_valid():
-            return
+    def get_who_attacked_you_checkbox_state(self) -> bool:
+        if not self.is_valid(): return False
+        self._who_atk_cb = self._who_atk_cb or self._find_by_name("Players who attacked you")
+        return self._get_cb(self._who_atk_cb.handle) if self._who_atk_cb else False
 
-        if not self.drops_checkbox_state:
-            self.drops_checkbox_state = self.find_element_by_name("Drops")
+    def set_who_attacked_you_checkbox_state(self, desired: bool) -> None:
+        if not self.is_valid(): return
+        self._who_atk_cb = self._who_atk_cb or self._find_by_name("Players who attacked you")
+        if self._who_atk_cb: self._set_cb(self._who_atk_cb.handle, desired)
 
-        state = win32gui.SendMessage(self.drops_checkbox_state.handle, win32con.BM_GETCHECK, 0, 0)
-        return state == win32con.BST_CHECKED
+    # ── Spy / Active buffs ────────────────────────────────────────────────
+    def set_spy_player_checkbox_state(self) -> None:
+        if not self.is_valid(): return
+        self._spy_player_cb = self._spy_player_cb or self._find_nth("Spy", 6)
+        if self._spy_player_cb:
+            if win32gui.SendMessage(self._spy_player_cb.handle, win32con.BM_GETCHECK, 0, 0) != win32con.BST_CHECKED:
+                win32gui.PostMessage(self._spy_player_cb.handle, win32con.BM_CLICK, 0, 0)
 
-    def set_drops_checkbox_state(self, desired_state):
-        if not self.is_valid():
-            return
+    def refresh_spy(self) -> None:
+        if not self.is_valid(): return
+        self._spy_refresh_btn = self._spy_refresh_btn or self._find_nth("Spy", 5)
+        if self._spy_refresh_btn:
+            win32gui.PostMessage(self._spy_refresh_btn.handle, win32con.BM_CLICK, 0, 0)
 
-        if not self.drops_checkbox_state:
-            self.drops_checkbox_state = self.find_element_by_name("Drops")
-
-        current = self.get_drops_checkbox_state()
-        if current != desired_state:
-            win32gui.PostMessage(self.drops_checkbox_state.handle, win32con.BM_CLICK, 0, 0)
-
-    def get_who_attacked_you_checkbox_state(self):
-        if not self.is_valid():
-            return
-
-        if not self.who_attacked_you_checkbox_state:
-            self.who_attacked_you_checkbox_state = self.find_element_by_name("Players who attacked you")
-
-        state = win32gui.SendMessage(self.who_attacked_you_checkbox_state.handle, win32con.BM_GETCHECK, 0, 0)
-        return state == win32con.BST_CHECKED
-
-    def set_who_attacked_you_checkbox_state(self, desired_state):
-        if not self.is_valid():
-            return
-
-        if not self.who_attacked_you_checkbox_state:
-            self.who_attacked_you_checkbox_state = self.find_element_by_name("Players who attacked you")
-
-        current = self.get_who_attacked_you_checkbox_state()
-        if current != desired_state:
-            win32gui.PostMessage(self.who_attacked_you_checkbox_state.handle, win32con.BM_CLICK, 0, 0)
-
-    def set_spy_player_checkbox_state(self):
-        if not self.is_valid():
-            return
-
-        if not self.spy_player_checkbox_state:
-            self.spy_player_checkbox_state = self.find_nth_element_by_name("Spy", 6)
-
-        state = win32gui.SendMessage(self.spy_player_checkbox_state.handle, win32con.BM_GETCHECK, 0, 0)
-        if state != win32con.BST_CHECKED:
-            win32gui.PostMessage(self.spy_player_checkbox_state.handle, win32con.BM_CLICK, 0, 0)
-
-    def refresh_spy(self):
-        if not self.is_valid():
-            return
-
-        if not self.refresh_spy_button:
-            self.refresh_spy_button = self.find_nth_element_by_name("Spy", 5)
-
-        win32gui.PostMessage(self.refresh_spy_button.handle, win32con.BM_CLICK, 0, 0)
-
-    def get_active_buffs(self):
-        result = []
-        is_found = False
-        start_collecting = False
-        if not self.is_valid():
-            return
-
-        if not self.spy_combo:
-            self.spy_combo = self.find_nth_element_by_name("Spy", 10)
-
-        if not self.spy_log:
-            self.spy_log = self.find_nth_element_by_name("Spy", 11)
-
-        count = win32gui.SendMessage(self.spy_combo.handle, win32con.CB_GETCOUNT, 0, 0)
-        pattern = re.compile(rf"^Name:\s+{self.get_name()}$")
-
-        for i in range(count):
-            win32gui.SendMessage(self.spy_combo.handle, win32con.WM_KEYDOWN, win32con.VK_DOWN, 0)
-            content = self.get_edit_content(self.spy_log.handle)
-            lines = content.splitlines()
-            for line in lines:
-                if pattern.search(line):
-                    is_found = True
-                    continue
-
-                if is_found:
-                    if line.startswith("Active buffs:"):
-                        start_collecting = True
-                        continue
-
-                    if start_collecting:
-                        line = line.lstrip("\t")
-                        result.append(line)
-                
-            if is_found:
-                return result
+    def get_active_buffs(self) -> list[str] | None:
+        if not self.is_valid(): return None
+        self._spy_combo = self._spy_combo or self._find_nth("Spy", 10)
+        self._spy_log   = self._spy_log   or self._find_nth("Spy", 11)
+        if not self._spy_combo or not self._spy_log: return None
+        pattern = re.compile(rf"^Name:\s+{re.escape(self.get_name())}$")
+        count = win32gui.SendMessage(self._spy_combo.handle, win32con.CB_GETCOUNT, 0, 0)
+        for _ in range(count):
+            win32gui.SendMessage(self._spy_combo.handle, win32con.WM_KEYDOWN, win32con.VK_DOWN, 0)
+            content = self._get_edit_content(self._spy_log.handle)
+            result = []; found = collecting = False
+            for line in content.splitlines():
+                if pattern.search(line): found = True; continue
+                if found:
+                    if line.startswith("Active buffs:"): collecting = True; continue
+                    if collecting: result.append(line.lstrip("\t"))
+            if found: return result
+        return None
 
 
-class ItemHpMpRow:
-    def __init__(self, parent, row):
-        self.frame = parent
-        self.name_label = ttk.Label(self.frame, text="Name: X")
-        self.kill_label = ttk.Label(self.frame, text="")
-        self.hp_label = ttk.Label(self.frame, text="HP:")
-        self.mp_label = ttk.Label(self.frame, text="  MP:")
-        self.hp_value = ttk.Progressbar(self.frame, mode="determinate", length=100)
-        self.mp_value = ttk.Progressbar(self.frame, mode="determinate", length=100)
-
-        self.name_label.grid(row=row, column=0, padx=5, pady=2, sticky="w")
-        self.hp_label.grid(row=row, column=1, padx=0, pady=2, sticky="w")
-        self.hp_value.grid(row=row, column=2, padx=0, pady=2, sticky="w")
-        self.mp_label.grid(row=row, column=3, padx=0, pady=2, sticky="w")
-        self.mp_value.grid(row=row, column=4, padx=0, pady=2, sticky="w")
-        self.kill_label.grid(row=row, column=5, padx=5, pady=2, sticky="w")
-
-    def destroy(self):
-        self.hp_label.destroy()
-        self.hp_value.destroy()
-        self.mp_label.destroy()
-        self.mp_value.destroy()
-        self.name_label.destroy()
-        self.kill_label.destroy()
-
-class Monitor(tk.Frame):
-    def __init__(self, master=None):
-        super().__init__(master)
-        self.bot_name_list = None
-        self.mbot_list = []
-        self.update_hp_mp_job = None
-        self.hp_mp_list = []
-        self.hp_mp_frame = None
-        self.update_chat_job = None
-        self.chat_label = None
-        self.chat_read_text = None
-        self.log_label = None
-        self.log_read_text = None
-        self.inventory_combo = None
-        self.inventory_options = INVENTORY_OPTIONS
-        self.current_log = LOG_OPTIONS[2]
-        self.inventory_combo_var = tk.StringVar()
-        self.drops_check_var = tk.StringVar()
-        self.who_attacked_you_check_var = tk.StringVar()
-
-        self.create_widgets()
-        self.update_hp_mp()
-
-    def process_mbots(self, mbot_list, actions):
-        def process_next(index=0):
-            if index >= len(mbot_list):
-                return
-
+# ---------------------------------------------------------------------------
+# ProcessMbotsMixin — sequential QTimer-based action runner
+# ---------------------------------------------------------------------------
+class ProcessMbotsMixin:
+    def process_mbots(self, mbot_list: list, actions: list[tuple]) -> None:
+        def _run(index: int = 0) -> None:
+            if index >= len(mbot_list): return
             mbot = mbot_list[index]
-            current_time = 0
+            acc_ms = 0
             for delay_ms, method in actions:
-                current_time += delay_ms
-                self.after(current_time, lambda m=mbot, meth=method: meth(m))
+                acc_ms += delay_ms
+                QTimer.singleShot(acc_ms, lambda m=mbot, fn=method: fn(m))
+            total = sum(d for d, _ in actions)
+            QTimer.singleShot(total + 100, lambda: _run(index + 1))
+        _run(0)
 
-            total_delay = sum(delay for delay, _ in actions)
-            self.after(total_delay + 100, lambda: process_next(index + 1))
 
-        process_next(0)
+# ---------------------------------------------------------------------------
+# Window scan
+# ---------------------------------------------------------------------------
+def scan_mbot_windows() -> list:
+    if not WIN32_AVAILABLE:
+        return []
+    try:
+        raw = findwindows.find_elements(class_name="#32770", visible_only=False, title_re=r".*[Mm][Bb]ot.*")
+        if not raw:
+            all_w = findwindows.find_elements(class_name="#32770", visible_only=False)
+            raw = [el for el in all_w if "mbot" in el.name.lower()]
+        return [MBotWindow(el) for el in sorted(raw, key=lambda e: e.name)]
+    except Exception:
+        return []
 
-    def create_bot_list_frame(self, parent_frame):
-        frame = ttk.Frame(parent_frame)
-        frame.pack(fill='x', pady=2)
-        ttk.Label(frame, text="mBot").pack(anchor='w')
 
-        scrollbar = tk.Scrollbar(frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+# ---------------------------------------------------------------------------
+# Reusable widgets
+# ---------------------------------------------------------------------------
 
-        self.bot_name_list = tk.Listbox(frame, selectmode=tk.EXTENDED, height=15, yscrollcommand=scrollbar.set, exportselection=False)
-        self.bot_name_list.pack(side=tk.LEFT, fill='both', expand=True)
-        self.bot_name_list.bind("<<ListboxSelect>>", self.show_mbot_log)
+class StatusDot(QWidget):
+    _COLORS = {
+        "training": "#6dc28a", "idle": "#d6b35a",
+        "dead":     "#d35d5d", "offline": "#5f5f67",
+    }
+    def __init__(self, status="offline", size=8, parent=None):
+        super().__init__(parent)
+        self.status = status
+        self.setFixedSize(size, size)
 
-        scrollbar.config(command=self.bot_name_list.yview)
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(self._COLORS.get(self.status, "#5f5f67"))))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(0, 0, self.width(), self.height())
 
-    def show_mbot_log(self, event):
-        selection = self.bot_name_list.curselection()
-        if selection:
-            if self.current_log == LOG_OPTIONS[0]:
-                self.update_inventory_log()
-            elif self.current_log == LOG_OPTIONS[1]:
-                self.update_inventory_pieces_log()
-            elif self.current_log == LOG_OPTIONS[2]:
-                self.update_log()
-            elif self.current_log == LOG_OPTIONS[3]:
-                self.update_active_buffs()
-            self.update_drops_state()
-            self.update_who_attacked_you_state()
 
-    def create_button_list_frame(self, parent_frame):
-        button_frame = ttk.Frame(parent_frame)
-        button_frame.pack(fill='x', pady=2)
+class MbotRow(QFrame):
+    clicked = pyqtSignal(int)
+    toggled = pyqtSignal(int, bool)
 
-        ttk.Button(button_frame, text="Refresh mBots", command=self.refresh_list).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Select all mBots", command=self.select_all).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Deselect all mBots", command=self.deselect_all).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Start client selected mBots", command=self.start_client_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Kill client selected mBots", command=self.kill_client_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Kill mBot selected mBots", command=self.kill_mbot_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Log Off selected mBots", command=self.log_off_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Show/Hide selected mBots", command=self.show_hide_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Show/Hide Client selected mBots", command=self.show_hide_client_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Reset selected mBots", command=self.reset_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Get current position selected mBots", command=self.get_current_position_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Start training selected mBots", command=self.start_training_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Stop training selected mBots", command=self.stop_training_selected).pack(fill='x', pady=1)
+    def __init__(self, mbot: MbotInfo, multi=True):
+        super().__init__()
+        self.mbot  = mbot
+        self.multi = multi
+        self.setObjectName("MbotRow")
+        self.setProperty("selected", False)
+        self.setProperty("focused", False)
+        self.setFixedHeight(28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def create_left_frame(self, x, y, width, height):
-        frame = ttk.Frame(self)
-        frame.place(x=x, y=y, width=width, height=height)
+        lay = QHBoxLayout(self); lay.setContentsMargins(10, 4, 10, 4); lay.setSpacing(8)
+        display = f"{mbot.char} - DC" if mbot.is_dc else mbot.char
+        color   = T['text_mute'] if mbot.is_dc else T['text']
+        name    = QLabel(display); name.setStyleSheet(f"font-size:12px; color:{color};")
+        lay.addWidget(name, 1)
 
-        self.create_bot_list_frame(frame)
-        self.create_button_list_frame(frame)
+    def _repaint(self):
+        self.style().unpolish(self); self.style().polish(self)
 
-    def create_hp_mp_frame(self, parent_frame, width):
-        self.hp_mp_frame = ttk.Frame(parent_frame)
-        self.hp_mp_frame.pack(fill='x', pady=2)
-        name_minsize = width / 5
-        hp_mp_label_minsize = width / 25
-        hp_mp_progress_bar_minsize = width / 5
-        kill_per_hours_minsize = (width - hp_mp_label_minsize * 2 - hp_mp_progress_bar_minsize * 2) / 2
+    def set_selected(self, v): self.setProperty("selected", v); self._repaint()
+    def set_focused(self, v):  self.setProperty("focused",  v); self._repaint()
 
-        self.hp_mp_frame.grid_columnconfigure(0, minsize=name_minsize)
-        self.hp_mp_frame.grid_columnconfigure(1, minsize=hp_mp_label_minsize)
-        self.hp_mp_frame.grid_columnconfigure(2, minsize=hp_mp_progress_bar_minsize)
-        self.hp_mp_frame.grid_columnconfigure(3, minsize=hp_mp_label_minsize)
-        self.hp_mp_frame.grid_columnconfigure(4, minsize=hp_mp_progress_bar_minsize)
-        self.hp_mp_frame.grid_columnconfigure(5, minsize=kill_per_hours_minsize)
-
-    def create_center_frame(self, x, y, width, height):
-        frame = ttk.Frame(self)
-        frame.place(x=x, y=y, width=width, height=height)
-
-        ttk.Label(frame, text="Character").pack(anchor='w')
-        self.create_hp_mp_frame(frame, width=width)
-
-    def update_chat(self, mbot, button_name):
-        if not mbot.is_valid():
-            if self.update_chat_job:
-                self.after_cancel(self.update_chat_job)
-            return
-
-        content = mbot.get_chat_content(button_name)
-        if self.chat_read_text.get("1.0", "end-1c") != content:
-            if content is not None:
-                self.chat_label.configure(text=f"Chat - {mbot.get_name()}")
-                self.chat_read_text.delete("1.0", "end")
-                self.chat_read_text.insert("1.0", content)
-                self.chat_read_text.see("end")
+    def mousePressEvent(self, e):
+        self.clicked.emit(self.mbot.id)
+        if self.multi:
+            if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.toggled.emit(self.mbot.id, not self.property("selected"))
             else:
-                self.chat_read_text.delete("1.0", "end")
-                return
-
-        self.update_chat_job = self.after(20000, lambda: self.update_chat(mbot, button_name))
-
-    def start_update_chat(self, button_name):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        if self.update_chat_job:
-            self.after_cancel(self.update_chat_job)
-
-        self.update_chat(mbot_list[0], button_name)
-
-    def create_chat_frame(self, parent_frame):
-        frame = ttk.Frame(parent_frame)
-        frame.pack(fill='x', pady=2)
-        for i, text in enumerate(CHAT_BUTTON_TEXTS):
-            btn = ttk.Button(frame, text=text, command=lambda t=text: self.start_update_chat(t))
-            btn.grid(row=0, column=i, padx=1, pady=5)
-
-        total_buttons = len(CHAT_BUTTON_TEXTS)
-        for i in range(total_buttons):
-            frame.grid_columnconfigure(i, weight=1)
-
-        scrollbar = tk.Scrollbar(frame)
-        scrollbar.grid(row=1, column=total_buttons, sticky="ns")
-
-        self.chat_read_text = tk.Text(frame, height=15, state="disabled", yscrollcommand=scrollbar.set)
-        self.chat_read_text.grid(row=1, column=0, columnspan=total_buttons, sticky="ew", padx=5, pady=5)
-        self.chat_read_text.config(state="normal")
-
-        scrollbar.config(command=self.chat_read_text.yview)
-
-    def update_active_buffs(self):
-        self.current_log = LOG_OPTIONS[3]
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        mbot_list[0].set_spy_player_checkbox_state()
-        mbot_list[0].set_spy_player_checkbox_state()
-        mbot_list[0].refresh_spy()
-        content = mbot_list[0].get_active_buffs()
-        if content is not None:
-            self.log_label.configure(text=f"Inventory & Log - {mbot_list[0].get_name()}")
-            self.log_read_text.delete("1.0", "end")
-            for line in content:
-                self.log_read_text.insert("end", line)
-                self.log_read_text.insert("end", "\n")
-
-    def update_inventory_pieces_log(self):
-        self.current_log = LOG_OPTIONS[1]
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        selected_option = self.inventory_combo_var.get()
-        index_option = self.inventory_options.index(selected_option)
-        mbot_list[0].set_inventory_combo(index_option)
-        mbot_list[0].refresh_inventory()
-        content = mbot_list[0].get_inventory_items()
-        if content is not None:
-            self.log_label.configure(text=f"Inventory & Log - {mbot_list[0].get_name()}")
-            item_totals = defaultdict(int)
-            slot_item_totals = defaultdict(int)
-            self.log_read_text.delete("1.0", "end")
-            for line in content:
-                match = re.search(r':\s*(.*?)\s*\((\d+)\s+pieces\)', line)
-                if match:
-                    item_name = match.group(1)
-                    quantity = int(match.group(2))
-                    item_totals[item_name] += quantity
-                    slot_item_totals[item_name] += 1
-            for item in sorted(item_totals):
-                self.log_read_text.insert("end", f"{item}: {item_totals[item]} pieces - {slot_item_totals[item]} slots")
-                self.log_read_text.insert("end", "\n")
-
-    def update_inventory_log(self):
-        self.current_log = LOG_OPTIONS[0]
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        selected_option = self.inventory_combo_var.get()
-        index_option = self.inventory_options.index(selected_option)
-        mbot_list[0].set_inventory_combo(index_option)
-        mbot_list[0].refresh_inventory()
-        content = mbot_list[0].get_inventory_items()
-        if content is not None:
-            self.log_label.configure(text=f"Inventory & Log - {mbot_list[0].get_name()}")
-            self.log_read_text.delete("1.0", "end")
-            for line in content:
-                self.log_read_text.insert("end", line)
-                self.log_read_text.insert("end", "\n")
-
-    def update_log(self):
-        self.current_log = LOG_OPTIONS[2]
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        content = mbot_list[0].get_log()
-        if content is not None:
-            self.log_label.configure(text=f"Inventory & Log - {mbot_list[0].get_name()}")
-            self.log_read_text.delete("1.0", "end")
-            self.log_read_text.insert("end", content)
-            self.log_read_text.see("end")
-
-    def clear_log(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.clear_log())
-            ]
-        )
-        self.log_label.configure(text=f"Inventory & Log - {mbot_list[0].get_name()}")
-        self.log_read_text.delete("1.0", "end")
-
-    def update_drops_state(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        state  = mbot_list[0].get_drops_checkbox_state()
-        self.drops_check_var.set(state)
-
-    def update_who_attacked_you_state(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        state  = mbot_list[0].get_who_attacked_you_checkbox_state()
-        self.who_attacked_you_check_var.set(state)
-
-    def on_drops_check_change(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.set_drops_checkbox_state(self.drops_check_var.get())),
-                (100, lambda mbot: mbot.save_settings())
-            ]
-        )
-
-    def on_who_attacked_you_check_change(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.set_who_attacked_you_checkbox_state(self.who_attacked_you_check_var.get())),
-                (100, lambda mbot: mbot.save_settings())
-            ]
-        )
-
-    def create_inventory_log_frame(self, parent_frame):
-        frame = ttk.Frame(parent_frame)
-        frame.pack(fill='x', pady=2)
-        columnspan_log = 15
-
-        for i in range(columnspan_log):
-            frame.grid_columnconfigure(i, weight=1)
-
-        refresh_button = ttk.Button(frame, text="Refresh", command=self.update_inventory_log)
-        refresh_button.grid(row=0, column=0, padx=0, pady=0)
-
-        only_pieces_button = ttk.Button(frame, text="Only pieces", command=self.update_inventory_pieces_log)
-        only_pieces_button.grid(row=0, column=1, padx=0, pady=0)
-
-        self.inventory_combo = ttk.Combobox(frame, textvariable=self.inventory_combo_var, values=self.inventory_options, state="readonly")
-        self.inventory_combo.current(3)
-        self.inventory_combo.grid(row=0, column=2, padx=0, pady=0)
-
-        active_buffs_button = ttk.Button(frame, text="Active buffs", command=self.update_active_buffs)
-        active_buffs_button.grid(row=0, column=3, padx=0, pady=0)
-
-        log_button = ttk.Button(frame, text="Log", command=self.update_log)
-        log_button.grid(row=1, column=0, padx=0, pady=0)
-        clear_button = ttk.Button(frame, text="Clear", command=self.clear_log)
-        clear_button.grid(row=1, column=1, padx=0, pady=0)
-
-        drops_checkbox_state = tk.Checkbutton(frame, text="Drops", variable=self.drops_check_var, command=self.on_drops_check_change)
-        drops_checkbox_state.grid(row=1, column=13, padx=0, pady=0)
-
-        who_attacked_you_checkbox_state = tk.Checkbutton(frame, text="Players who attacked you", variable=self.who_attacked_you_check_var, command=self.on_who_attacked_you_check_change)
-        who_attacked_you_checkbox_state.grid(row=1, column=14, padx=0, pady=0)
-
-        scrollbar = tk.Scrollbar(frame)
-        scrollbar.grid(row=2, column=columnspan_log, sticky="ns")
-
-        self.log_read_text = tk.Text(frame, height=14, state="disabled")
-        self.log_read_text.grid(row=2, column=0, columnspan=columnspan_log, sticky="ew", padx=5, pady=5)
-        self.log_read_text.config(state="normal")
-
-        scrollbar.config(command=self.log_read_text.yview)
-
-    def create_right_frame(self, x, y, width, height):
-        frame = ttk.Frame(self)
-        frame.place(x=x, y=y, width=width, height=height)
-
-        self.chat_label = ttk.Label(frame, text="Chat")
-        self.chat_label.pack(anchor='w')
-        self.create_chat_frame(frame)
-        self.log_label = ttk.Label(frame, text="Inventory & Log")
-        self.log_label.pack(anchor='w')
-        self.create_inventory_log_frame(frame)
-
-    def create_widgets(self):
-        left_frame_width = WINDOW_WIDTH * 2 / 12
-        left_frame_height = WINDOW_HEIGHT
-        left_frame_x = TOP_LEFT_X
-        left_frame_y = TOP_LEFT_Y
-        self.create_left_frame(x=left_frame_x, y=left_frame_y, width=left_frame_width, height=left_frame_height)
-
-        center_frame_width = WINDOW_WIDTH * 4 / 12
-        center_frame_height = WINDOW_HEIGHT
-        center_frame_x = left_frame_width
-        center_frame_y = TOP_LEFT_Y
-        self.create_center_frame(x=center_frame_x, y=center_frame_y, width=center_frame_width, height=center_frame_height)
-
-        right_frame_width = WINDOW_WIDTH - center_frame_width - left_frame_width
-        right_frame_height = WINDOW_HEIGHT
-        right_frame_x = WINDOW_WIDTH - right_frame_width
-        right_frame_y = TOP_LEFT_Y
-        self.create_right_frame(x=right_frame_x, y=right_frame_y, width=right_frame_width, height=right_frame_height)
-
-        self.refresh_list()
-
-    def refresh_list(self):
-        mbot_list = findwindows.find_elements(class_name="#32770", visible_only=False, title_re=".*mBot.*")
-        if mbot_list:
-            self.mbot_list.clear()
-            self.bot_name_list.delete(0, tk.END)
-            sorted_mbot_list = sorted(mbot_list, key=lambda e: e.name)
-            for mbot in sorted_mbot_list:
-                self.mbot_list.append(MBot(mbot))
-                self.bot_name_list.insert(tk.END, mbot.name)
-            sorted_mbot_list.clear()
-            mbot_list.clear()
-
-            if self.update_hp_mp_job:
-                self.after_cancel(self.update_hp_mp_job)
-
-            for item in self.hp_mp_list:
-                item.destroy()
-            self.hp_mp_list.clear()
-            self.update_hp_mp()
-
-    def update_hp_mp(self):
-        size_of_list = self.bot_name_list.size()
-        if len(self.hp_mp_list) != size_of_list:
-            self.hp_mp_list.clear()
-            for i in range(size_of_list):
-                self.hp_mp_list.append(ItemHpMpRow(self.hp_mp_frame, i))
-
-        for i in range(size_of_list):
-            self.hp_mp_list[i].name_label.configure(text=self.mbot_list[i].get_name())
-            self.hp_mp_list[i].hp_value['value'] = self.mbot_list[i].get_hp()
-            self.hp_mp_list[i].mp_value['value'] = self.mbot_list[i].get_mp()
-            self.hp_mp_list[i].kill_label.configure(text=self.mbot_list[i].get_kills_per_hour())
-        self.update_hp_mp_job = self.after(2000, self.update_hp_mp)
-
-    def select_all(self):
-        self.bot_name_list.select_set(0, tk.END)
-
-    def deselect_all(self):
-        self.bot_name_list.select_clear(0, tk.END)
-
-    def start_client_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.set_delay(False)),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.save_settings()),
-                (10000, lambda mbot: mbot.start_client())
-            ]
-        )
-
-    def kill_client_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        confirm = messagebox.askyesno("Confirmation", "Kill all client selected mBots ?")
-        if not confirm:
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.kill_client())
-            ]
-        )
-
-    def kill_mbot_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        confirm = messagebox.askyesno("Confirmation", "Close all selected mBots?")
-        if not confirm:
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        if self.update_hp_mp_job:
-            self.after_cancel(self.update_hp_mp_job)
-            self.update_hp_mp_job = None
-
-        reset_time = len(mbot_list) * 100 + 500
-        self.after(reset_time, lambda: self.refresh_list())
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.kill_mbot())
-            ]
-        )
-
-    def log_off_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        confirm = messagebox.askyesno("Confirmation", "Log off all selected mBots?")
-        if not confirm:
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.set_delay()),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.log_off())
-            ]
-        )
-
-    def show_hide_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.show_hide_mbot())
-            ]
-        )
-
-    def show_hide_client_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.show_hide_client())
-            ]
-        )
-
-    def reset_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.reset_mbot())
-            ]
-        )
-
-    def get_current_position_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.get_current_position())
-            ]
-        )
-
-    def start_training_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.set_delay(False)),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.start_training())
-            ]
-        )
-
-    def stop_training_selected(self):
-        selected = self.bot_name_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose at least one mBot")
-            return
-
-        mbot_list = [self.mbot_list[i] for i in selected]
-        self.process_mbots(
-            mbot_list,
-            actions=[
-                (0, lambda mbot: mbot.stop_training())
-            ]
-        )
-
-class Account(tk.Frame):
-    def __init__(self, master=None):
-        super().__init__(master)
-        self.account_list = None
-        self.pending_start_mbot = None
-        self.username_entry = None
-        self.password_entry = None
-        self.delay_entry = None
-        self.character_entry = None
-        self.username_var = None
-        self.password_var = None
-        self.delay_var = None
-        self.character_var = None
-        self.mbot_file_var = tk.StringVar()
-        self.sro_folder_var = tk.StringVar()
-
-        self.create_widgets()
-        self.update_listbox()
-
-    def process_mbots(self, mbot_list, actions):
-        def process_next(index=0):
-            if index >= len(mbot_list):
-                return
-
-            mbot = mbot_list[index]
-            current_time = 0
-            for delay_ms, method in actions:
-                current_time += delay_ms
-                self.after(current_time, lambda m=mbot, meth=method: meth(m))
-
-            total_delay = sum(delay for delay, _ in actions)
-            self.after(total_delay + 100, lambda: process_next(index + 1))
-
-        process_next(0)
-
-    def create_widgets(self):
-        left_frame_width = WINDOW_WIDTH * 2 / 12
-        left_frame_height = WINDOW_HEIGHT
-        left_frame_x = TOP_LEFT_X
-        left_frame_y = TOP_LEFT_Y
-        self.create_left_frame(x=left_frame_x, y=left_frame_y, width=left_frame_width, height=left_frame_height)
-
-        right_frame_width = WINDOW_WIDTH - left_frame_width
-        right_frame_height = WINDOW_HEIGHT
-        right_frame_x = WINDOW_WIDTH - right_frame_width
-        right_frame_y = TOP_LEFT_Y
-        self.create_right_frame(x=right_frame_x, y=right_frame_y, width=right_frame_width, height=right_frame_height)
-
-    def create_left_frame(self, x, y, width, height):
-        frame = ttk.Frame(self)
-        frame.place(x=x, y=y, width=width, height=height)
-
-        self.create_account_list_frame(frame)
-        self.create_button_list_frame(frame)
-
-    def create_account_list_frame(self, parent_frame):
-        frame = ttk.Frame(parent_frame)
-        frame.pack(fill='x', pady=2)
-        ttk.Label(frame, text="Account").pack(anchor='w')
-
-        scrollbar = tk.Scrollbar(frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.account_list = tk.Listbox(frame, selectmode=tk.EXTENDED, height=15, yscrollcommand=scrollbar.set)
-        self.account_list.pack(side=tk.LEFT, fill='both', expand=True)
-        self.account_list.bind("<<ListboxSelect>>", self.show_account)
-
-        scrollbar.config(command=self.account_list.yview)
-
-    def create_button_list_frame(self, parent_frame):
-        button_frame = ttk.Frame(parent_frame)
-        button_frame.pack(fill='x', pady=2)
-
-        ttk.Button(button_frame, text="Delete account", command=self.delete_account).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Select all mBots", command=self.select_all).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Deselect all mBots", command=self.deselect_all).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Start mbBot & login SRO client", command=self.start_mbot_and_login_sro_selected).pack(fill='x', pady=1)
-        ttk.Button(button_frame, text="Disable always-on-top SRO client", command=self.disable_always_on_top).pack(fill='x', pady=1)
-
-    def select_all(self):
-        self.account_list.select_set(0, tk.END)
-
-    def deselect_all(self):
-        self.account_list.select_clear(0, tk.END)
-
-    def hide_mbot_and_sro_client(self, index):
-        index_real = self.pending_start_mbot[index]
-        character = accounts[index_real]["character"]
-        mbot_list = findwindows.find_elements(class_name="#32770", title=f"[{character}] mBot v1.12b (vSRO 110)")
-        if not mbot_list:
-            return
-
-        mbot_list_process = []
-        mbot_list_process.append(MBot(mbot_list[0]))
-        self.process_mbots(
-            mbot_list_process,
-            actions=[
-                (0, lambda mbot: mbot.set_delay()),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.save_settings()),
-                (100, lambda mbot: mbot.start_training()),
-                (100, lambda mbot: mbot.show_hide_client()),
-                (100, lambda mbot: mbot.show_hide_mbot())
-            ]
-        )
-        self.after(2000, lambda: self.start_mbot_client(index + 1))
-
-    def start_training_sro(self, index):
-        index_real = self.pending_start_mbot[index]
-        character = accounts[index_real]["character"]
-        windows = findwindows.find_elements(class_name="CLIENT", title=character)
-        if not windows:
-            return self.after(5000, lambda: self.start_training_sro(index))
-
-        handle = windows[0].handle
-        win32gui.SetWindowPos(
-            handle,
-            win32con.HWND_NOTOPMOST,
-            0, 0, 0, 0,
-            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
-        )
-
-        mbot_list = findwindows.find_elements(class_name="#32770", title=f"[{character}] mBot v1.12b (vSRO 110)")
-        if not mbot_list:
-            return
-        mbot = MBot(mbot_list[0])
-        mbot.start_training()
-
-        self.after(5000, lambda: self.hide_mbot_and_sro_client(index))
-
-    def login_sro(self, index):
-        def step_find_window():
-            windows = findwindows.find_elements(class_name="CLIENT", title="SRO_Client")
-            if not windows:
-                return self.after(2000, lambda: self.login_sro(index))
-
-            handle = windows[0].handle
-            ctypes.windll.user32.ShowWindow(handle, 5)
-
-            win32gui.SetWindowPos(
-                handle,
-                win32con.HWND_TOPMOST,
-                0, 0, 0, 0,
-                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
-            )
-
-            rect = win32gui.GetWindowRect(handle)
-            left, top, right, bottom = rect
-
-            width = right - left
-            height = bottom - top
-            center_x = left + width//2
-            center_y = top + height//2
-
-            self.after(200, lambda: step_click_center(center_x, center_y))
-
-        def step_click_center(x, y):
-            auto.Click(x, y)
-            self.after(200, lambda: step_click_server(x, y))
-
-        def step_click_server(x, y):
-            auto.Click(x, y - 125)
-            self.after(200, lambda: step_click_choose_server(x, y))
-
-        def step_click_choose_server(x, y):
-            auto.Click(x - 50, y + 200)
-            self.after(200, lambda: step_enter_credentials())
-
-        def step_enter_credentials():
-            index_real = self.pending_start_mbot[index]
-            username = accounts[index_real]["username"]
-            password = accounts[index_real]["password"]
-            password_decode = base64.b64decode(password).decode("utf-8")
-            auto.SendKeys('{Tab}', interval=0.08)
-            auto.SendKeys(username, interval=0.08)
-            auto.SendKeys('{Tab}', interval=0.08)
-            auto.SendKeys(password_decode, interval=0.08)
-            auto.SendKeys('{Enter}', interval=0.08)
-            self.after(15000, lambda: self.start_training_sro(index))
-
-        step_find_window()
-
-    def start_client_sro(self, index):
-        mbot_list = findwindows.find_elements(class_name="#32770", title="mBot v1.12b (vSRO 110)")
-        if not mbot_list:
-            return self.after(2000, lambda: self.start_client_sro(index))
-        mbot = MBot(mbot_list[0])
-        mbot.start_client()
-        self.after(10000, lambda: self.login_sro(index))
-
-    def confirm_if_need(self, index):
-        confirm = click_confirmation(title="Electus.*", text="OK", is_re=True)
-        if confirm:
-            self.after(1000, lambda: self.confirm_if_need(index))
+                self.toggled.emit(self.mbot.id, True)
+        super().mousePressEvent(e)
+
+
+class MbotListColumn(QFrame):
+    selection_changed = pyqtSignal(list)
+    focus_changed     = pyqtSignal(int)
+
+    def __init__(self, multi=True, initial_selected=None, initial_focus=None):
+        super().__init__()
+        self.setObjectName("Col")
+        self.multi    = multi
+        self.selected = list(initial_selected or [])
+        self.focused  = initial_focus
+        self.rows:    dict[int, MbotRow] = {}
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+
+        # Header
+        hdr = QFrame()
+        hdr.setStyleSheet(f"background:{T['bg_deep']}; border-bottom:1px solid {T['border']};")
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(12,8,12,8); hl.setSpacing(8)
+        title = QLabel("MBOTS"); title.setObjectName("ColHeader")
+        title.setStyleSheet("background:transparent; border:none; padding:0;")
+        self._count_pill = QLabel("0"); self._count_pill.setObjectName("Pill")
+        hl.addWidget(title); hl.addStretch(1); hl.addWidget(self._count_pill)
+        root.addWidget(hdr)
+
+        # Quick-select toolbar (multi-select only)
+        if multi:
+            qa = QHBoxLayout(); qa.setContentsMargins(8,6,8,6); qa.setSpacing(6)
+            sa = QPushButton("Select all"); sa.clicked.connect(self.select_all)
+            cl = QPushButton("Clear");      cl.clicked.connect(self.clear)
+            qa.addWidget(sa); qa.addWidget(cl)
+            wrap = QFrame(); wrap.setLayout(qa)
+            wrap.setStyleSheet(f"border-bottom:1px solid {T['border_light']};")
+            root.addWidget(wrap)
+
+        # Scrollable row area
+        self._scroll = QScrollArea(); self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._body = QWidget()
+        self._bl   = QVBoxLayout(self._body)
+        self._bl.setContentsMargins(8,8,8,8); self._bl.setSpacing(4)
+        self._scroll.setWidget(self._body)
+        root.addWidget(self._scroll, 1)
+        self.setFixedWidth(240)
+        self.reload()
+
+    def reload(self):
+        existing = {m.id for m in _live_mbots}
+        self.selected = [i for i in self.selected if i in existing]
+        if self.focused not in existing:
+            self.focused = _live_mbots[0].id if _live_mbots else None
+        # Clear rows
+        while self._bl.count():
+            item = self._bl.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.rows.clear()
+        for m in _live_mbots:
+            row = MbotRow(m, self.multi)
+            row.clicked.connect(self._on_focus)
+            row.toggled.connect(self._on_toggle)
+            row.set_selected(m.id in self.selected)
+            row.set_focused(m.id == self.focused)
+            self.rows[m.id] = row
+            self._bl.addWidget(row)
+        self._bl.addStretch(1)
+        self._count_pill.setText(str(len(_live_mbots)))
+
+    def _on_focus(self, mid):
+        self.focused = mid
+        for rid, row in self.rows.items():
+            row.set_focused(rid == mid)
+        self.focus_changed.emit(mid)
+        self.setFocus()
+
+    def _on_toggle(self, mid, on):
+        mods = QApplication.keyboardModifiers()
+        if self.multi and not (mods & Qt.KeyboardModifier.ControlModifier):
+            self.selected = [mid] if on else []
+            for rid, row in self.rows.items():
+                row.set_selected(rid == mid and on)
         else:
-            self.after(2000, lambda: self.start_client_sro(index))
+            if on and mid not in self.selected:
+                self.selected.append(mid)
+            elif not on and mid in self.selected:
+                self.selected.remove(mid)
+            self.rows[mid].set_selected(on)
+        self.selection_changed.emit(self.selected)
 
-    def start_mbot_client(self, index):
-        if index >= len(self.pending_start_mbot):
-            return
-        
-        index_real = self.pending_start_mbot[index]
-        character = accounts[index_real]["character"]
-        mbot_list = findwindows.find_elements(class_name="#32770", title=f"[{character}] mBot v1.12b (vSRO 110)", visible_only=False)
-        if mbot_list:
-            return self.after(1000, lambda: self.start_mbot_client(index + 1))
-        
-        mbot_list = findwindows.find_elements(class_name="#32770", title=f"[{character} - DC] mBot v1.12b (vSRO 110)", visible_only=False)
-        if mbot_list:
-            return self.after(1000, lambda: self.start_mbot_client(index + 1))
+    def keyPressEvent(self, e):
+        ids = [m.id for m in _live_mbots]
+        if not ids: return super().keyPressEvent(e)
+        cur = ids.index(self.focused) if self.focused in ids else 0
+        if e.key() == Qt.Key.Key_Down:
+            self._on_focus(ids[min(len(ids)-1, cur+1)]); return
+        if e.key() == Qt.Key.Key_Up:
+            self._on_focus(ids[max(0, cur-1)]); return
+        if e.key() == Qt.Key.Key_Space and self.multi:
+            self._on_toggle(self.focused, self.focused not in self.selected); return
+        super().keyPressEvent(e)
 
-        mbot_path = accounts[index_real]["mbot_file_path"]
-        folder_path = os.path.normpath(os.path.dirname(mbot_path))
-        subprocess.Popen(mbot_path,cwd=folder_path)
+    def select_all(self):
+        self.selected = [m.id for m in _live_mbots]
+        for row in self.rows.values(): row.set_selected(True)
+        self.selection_changed.emit(self.selected)
 
-        self.after(15000, lambda: self.confirm_if_need(index))
+    def clear(self):
+        self.selected = []
+        for row in self.rows.values(): row.set_selected(False)
+        self.selection_changed.emit(self.selected)
 
-    def start_mbot_and_login_sro_selected(self):
-        selected = self.account_list.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please choose one mBot")
-            return
 
-        self.pending_start_mbot = selected
-        self.start_mbot_client(0)
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 
-    def disable_always_on_top(self):
-        windows = findwindows.find_elements(class_name="CLIENT", visible_only=False)
-        for window in windows:
-            hwnd = window.handle
-            win32gui.SetWindowPos(
-                    hwnd,
-                    win32con.HWND_NOTOPMOST,
-                    0, 0, 0, 0,
-                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
-                )
+class CharCard(QFrame):
+    def __init__(self, mbot: MbotInfo):
+        super().__init__()
+        self.mbot_id = mbot.id
+        self.setObjectName("CharCard")
+        self.setFixedHeight(34)
 
-    def create_right_frame(self, x, y, width, height):
-        frame = ttk.Frame(self)
-        frame.place(x=x, y=y, width=width, height=height)
+        lay = QHBoxLayout(self); lay.setContentsMargins(10,5,10,5); lay.setSpacing(8)
+        color = T['text_mute'] if mbot.is_dc else T['text']
+        name  = QLabel(mbot.char); name.setStyleSheet(f"font-weight:600; font-size:12px; color:{color};")
+        name.setFixedWidth(68); lay.addWidget(name)
 
-        ttk.Label(frame, text="Sign up").pack(anchor='w')
-        self.create_sign_up_frame(frame)
-        ttk.Label(frame, text="Detail").pack(anchor='w')
-        self.create_detail_frame(frame)
+        def _bar(label: str, color_key: str):
+            lbl = QLabel(label); lbl.setStyleSheet(f"color:{T['text_mute']}; font-size:10px;"); lbl.setFixedWidth(16)
+            bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0)
+            bar.setTextVisible(False); bar.setFixedHeight(7)
+            bar.setStyleSheet(
+                f"QProgressBar{{background:{T['bg_deep']};border:1px solid {T['border']};border-radius:2px;}}"
+                f"QProgressBar::chunk{{background:{T[color_key]};border-radius:2px;}}"
+            )
+            return lbl, bar
 
-    def create_sign_up_frame(self, parent_frame):
-        frame = ttk.Frame(parent_frame)
-        frame.pack(fill='x', pady=2)
+        hp_lbl, self.hp_bar = _bar("HP", "hp")
+        mp_lbl, self.mp_bar = _bar("MP", "mp")
+        lay.addWidget(hp_lbl); lay.addWidget(self.hp_bar, 2)
+        lay.addWidget(mp_lbl); lay.addWidget(self.mp_bar, 2)
 
-        tk.Label(frame, text="Username:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.username_entry = tk.Entry(frame)
-        self.username_entry.grid(row=0, column=1, padx=5, pady=2, sticky="w")
+        self.kph_lbl = QLabel(); self.kph_lbl.setFixedWidth(80); lay.addWidget(self.kph_lbl)
+        self.refresh(mbot)
 
-        tk.Label(frame, text="Password:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
-        self.password_entry = tk.Entry(frame, show="*")
-        self.password_entry.grid(row=0, column=3, padx=5, pady=2, sticky="w")
-
-        tk.Label(frame, text="Delay:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
-        self.delay_entry = tk.Entry(frame)
-        self.delay_entry.grid(row=0, column=5, padx=5, pady=2, sticky="w")
-
-        tk.Label(frame, text="Character:").grid(row=0, column=6, padx=5, pady=2, sticky="w")
-        self.character_entry = tk.Entry(frame)
-        self.character_entry.grid(row=0, column=7, padx=5, pady=2, sticky="w")
-
-        tk.Button(frame, text="Add account", command=self.add_account).grid(row=0, column=8, padx=5, pady=2, sticky="w")
-
-    def create_detail_frame(self, parent_frame):
-        frame = ttk.Frame(parent_frame)
-        frame.pack(fill='x', pady=2)
-
-        tk.Label(frame, text="Username:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.username_var = tk.StringVar()
-        tk.Entry(frame, textvariable=self.username_var, state='readonly').grid(row=0, column=1, padx=5, pady=2, sticky="w")
-
-        tk.Label(frame, text="Password:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
-        self.password_var = tk.StringVar()
-        tk.Entry(frame, textvariable=self.password_var, show="*").grid(row=0, column=3, padx=5, pady=2, sticky="w")
-
-        tk.Label(frame, text="Delay:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
-        self.delay_var = tk.StringVar()
-        tk.Entry(frame, textvariable=self.delay_var).grid(row=0, column=5, padx=5, pady=2, sticky="w")
-
-        tk.Label(frame, text="Character:").grid(row=0, column=6, padx=5, pady=2, sticky="w")
-        self.character_var = tk.StringVar()
-        tk.Entry(frame, textvariable=self.character_var).grid(row=0, column=7, padx=5, pady=2, sticky="w")
-
-        tk.Button(frame, text="Update account", command=self.update_account).grid(row=0, column=8, padx=5, pady=2, sticky="w")
-
-        mbot_file_button = tk.Button(frame, text="Select file start mBot", command=self.select_mbot_file)
-        mbot_file_button.grid(row=1, column=0, padx=5, pady=5)
-        tk.Entry(frame, textvariable=self.mbot_file_var, state='readonly').grid(row=1, column=1, padx=5, pady=2, sticky="we", columnspan=8)
-
-        sro_folder_button = tk.Button(frame, text="   Select folder SRO   ", command=self.select_sro_folder)
-        sro_folder_button.grid(row=2, column=0, padx=5, pady=5)
-        tk.Entry(frame, textvariable=self.sro_folder_var, state='readonly').grid(row=2, column=1, padx=5, pady=2, sticky="we", columnspan=8)
-
-    def select_mbot_file(self):
-        if not self.username_var.get():
-            messagebox.showwarning("Warning", "Please choose one account")
-            return
-
-        mbot_path = filedialog.askopenfilename(
-            title="Select mBot file",
-            filetypes=[("Applications", "*.exe"), ("All files", "*.*")]
+    def refresh(self, mbot: MbotInfo):
+        v = 0 if mbot.is_dc else int(mbot.hp)
+        self.hp_bar.setValue(v)
+        v = 0 if mbot.is_dc else int(mbot.mp)
+        self.mp_bar.setValue(v)
+        self.kph_lbl.setText(
+            f"<span style='color:{T['text_mute']};font-size:10px;'>K/h</span> "
+            f"<span style='color:{T['accent']};font-family:\"JetBrains Mono\",monospace;"
+            f"font-size:11px;font-weight:600;'>{mbot.kph}</span>"
         )
-        if mbot_path:
-            mbot_path = mbot_path.replace("/", "\\")
-            self.mbot_file_var.set(mbot_path)
-            folder_path = os.path.normpath(os.path.dirname(mbot_path))
-            for f in os.listdir(folder_path):
-                if f.strip().lower() == "config.ini":
-                    config_path = os.path.join(folder_path, f)
-                    break
 
-            if not config_path:
-                return
 
-            with open(config_path, "r", encoding="utf-16-le", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.lower().startswith("srodir="):
-                        srodir_value = line.split("=", 1)[1]
-                        self.sro_folder_var.set(srodir_value)
-                        break
-                    else:
-                        continue
+class DashboardPanel(ProcessMbotsMixin, QWidget):
+    log_event = pyqtSignal(str, str)
 
-    def select_sro_folder(self):
-        if not self.username_var.get():
-            messagebox.showwarning("Warning", "Please choose one account")
-            return
+    _BUTTON_GRID = [
+        # (id, label, kind, row, col)
+        ("refresh",     "Refresh mBots",    None,  0, 0),
+        ("showHide",    "Show/Hide mBots",  None,  0, 1),
+        ("killBot",     "Kill mBots",       None,  0, 2),
+        ("startClient", "Start client",     None,  1, 0),
+        ("showHideCli", "Show/Hide Client", None,  1, 1),
+        ("killClient",  "Kill client",      None,  1, 2),
+        ("logoff",      "Log Off",          None,  1, 3),
+        ("reset",       "Reset",            None,  2, 0),
+        ("getPos",      "Get Position",     None,  2, 1),
+        ("startTrain",  "Start Training",   None,  2, 2),
+        ("stopTrain",   "Stop Training",    None,  2, 3),
+    ]
 
-        shell = win32com.client.Dispatch("Shell.Application")
-        folder = shell.BrowseForFolder(0, "Select Folder", 0, 0)
-        if folder:
-            self.sro_folder_var.set(folder.Self.Path)
-
-    def update_listbox(self):
-        self.account_list.delete(0, tk.END)
-        for account in accounts:
-            self.account_list.insert(tk.END, account["username"])
-
-    def show_account(self, event):
-        selection = self.account_list.curselection()
-        if selection:
-            index = selection[0]
-            account = accounts[index]
-            self.username_var.set(account["username"])
-            self.password_var.set(base64.b64decode(account["password"]).decode('utf-8'))
-            self.delay_var.set(str(account.get("delay_time", 0)))
-            self.character_var.set(account["character"])
-            self.mbot_file_var.set(account["mbot_file_path"])
-            self.sro_folder_var.set(account["sro_folder_path"])
-
-    def add_account(self):
-        username = self.username_entry.get().strip()
-        password = self.password_entry.get().strip()
-        delay_time = self.delay_entry.get().strip()
-        character = self.character_entry.get().strip()
-
-        if not username or not password:
-            messagebox.showwarning("Input Error", "Username and password required!")
-            return
-
-        if not character:
-            messagebox.showwarning("Input Error", "Character required!")
-            return
-
-        try:
-            delay_time_int = int(delay_time) if delay_time else 0
-        except ValueError:
-            messagebox.showwarning("Input Error", "Delay time must be an integer!")
-            return
-
-        for account in accounts:
-            if account["username"] == username:
-                messagebox.showerror("Error", "Username already exists!")
-                return
-
-        encoded_password = base64.b64encode(password.encode('utf-8')).decode('utf-8')
-        accounts.append({"username": username, "password": encoded_password, "delay_time": delay_time_int, "character": character,"mbot_file_path": "", "sro_folder_path": ""})
-        save_accounts()
-        self.update_listbox()
-        self.username_entry.delete(0, tk.END)
-        self.password_entry.delete(0, tk.END)
-        self.delay_entry.delete(0, tk.END)
-        self.character_entry.delete(0, tk.END)
-        messagebox.showinfo("Success", "Account added!")
-
-    def update_folder_sro(self):
-        sro_folder_path = self.sro_folder_var.get()
-        mbot_path = self.mbot_file_var.get()
-
-        folder_path = os.path.normpath(os.path.dirname(mbot_path))
-        config_path = None
-
-        for f in os.listdir(folder_path):
-            if f.strip().lower() == "config.ini":
-                config_path = os.path.join(folder_path, f)
-                break
-
-        if not config_path:
-            return
-
-        with open(config_path, "r", encoding="utf-16-le", errors="ignore") as f:
-            lines = f.readlines()
-
-        for i, line in enumerate(lines):
-            if line.strip().lower().startswith("srodir="):
-                lines[i] = f"srodir={sro_folder_path}\n"
-                break
-
-        with open(config_path, "w", encoding="utf-16-le") as f:
-            f.writelines(lines)
-
-    def update_account(self):
-        selection = self.account_list.curselection()
-        if not selection:
-            messagebox.showwarning("Select account", "Please select an account to update!")
-            return
-        index = selection[0]
-
-        new_password = self.password_var.get()
-        new_delay = self.delay_var.get()
-        new_character = self.character_var.get()
-        new_mbot_file_path = self.mbot_file_var.get()
-        new_sro_folder_path = self.sro_folder_var.get()
-
-        if not new_mbot_file_path or not new_sro_folder_path:
-            messagebox.showwarning("Warning", "Please select file start mBot and select folder SRO")
-            return
-        self.update_folder_sro()
-
-        try:
-            new_delay_int = int(new_delay) if new_delay else 0
-        except ValueError:
-            messagebox.showwarning("Input Error", "Delay time must be an integer!")
-            return
-
-        encoded_password = base64.b64encode(new_password.encode('utf-8')).decode('utf-8')
-        accounts[index]["password"] = encoded_password
-        accounts[index]["delay_time"] = new_delay_int
-        accounts[index]["character"] = new_character
-        accounts[index]["mbot_file_path"] = new_mbot_file_path
-        accounts[index]["sro_folder_path"] = new_sro_folder_path
-
-        save_accounts()
-        self.update_listbox()
-        messagebox.showinfo("Updated", "Account updated!")
-
-    def delete_account(self):
-        selection = self.account_list.curselection()
-        if not selection:
-            messagebox.showwarning("Select account", "Please select an account to remove!")
-            return
-        index = selection[0]
-        confirm = messagebox.askyesno("Confirmation", f"Delete '{accounts[index]['username']}'?")
-        if confirm:
-            accounts.pop(index)
-            save_accounts()
-            self.update_listbox()
-            self.username_var.set("")
-            self.password_var.set("")
-            self.delay_var.set("")
-            self.character_var.set("")
-            self.mbot_file_var.set("")
-            self.sro_folder_var.set("")
-
-class MBotManager(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("mBot Controller")
-        self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
-        self.resizable(False, False)
+        self._dc_pending_next = None
+        root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
 
-        notebook = ttk.Notebook(self)
-        notebook.pack(expand=True, fill='both')
+        # ── Top: mbot list + character cards ─────────────────────────────
+        top = QHBoxLayout(); top.setContentsMargins(0,0,0,0); top.setSpacing(0)
 
-        self.account_page = ttk.Frame(notebook)
-        notebook.add(self.account_page, text="Account")
+        self.list_col = MbotListColumn(multi=True, initial_selected=[1], initial_focus=1)
+        self.list_col.selection_changed.connect(self._on_sel)
+        top.addWidget(self.list_col)
 
-        self.monitor_page =  ttk.Frame(notebook)
-        notebook.add(self.monitor_page, text="Monitor")
+        col_chars = QFrame(); col_chars.setObjectName("Col")
+        cc = QVBoxLayout(col_chars); cc.setContentsMargins(0,0,0,0); cc.setSpacing(0)
+        hdr_chars = QFrame()
+        hdr_chars.setStyleSheet(f"background:{T['bg_deep']}; border-bottom:1px solid {T['border']};")
+        hc = QHBoxLayout(hdr_chars); hc.setContentsMargins(12,8,12,8)
+        hc.addWidget(QLabel("CHARACTERS")); hc.addStretch(1)
+        self.char_pill = QLabel("0 online"); self.char_pill.setObjectName("Pill")
+        hc.addWidget(self.char_pill)
+        cc.addWidget(hdr_chars)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.Shape.NoFrame)
+        self._char_inner  = QWidget()
+        self._char_layout = QVBoxLayout(self._char_inner)
+        self._char_layout.setContentsMargins(10,10,10,10); self._char_layout.setSpacing(6)
+        self._char_layout.addStretch(1)
+        sc.setWidget(self._char_inner)
+        cc.addWidget(sc, 1)
+        top.addWidget(col_chars, 1)
+        self._char_cards: dict[int, CharCard] = {}
 
-    def run(self):
-        account = Account(self.account_page)
-        account.pack(expand=True, fill='both')
-        monitor = Monitor(self.monitor_page)
-        monitor.pack(expand=True, fill='both')
+        top_w = QWidget(); top_w.setLayout(top)
+        root.addWidget(top_w, 1)
+
+        # ── Bottom: action buttons ────────────────────────────────────────
+        actions = QFrame()
+        actions.setStyleSheet(f"background:{T['bg_deep']}; border-top:1px solid {T['border']};")
+        af = QVBoxLayout(actions); af.setContentsMargins(0,0,0,0); af.setSpacing(0)
+
+        act_hdr = QFrame()
+        act_hdr.setStyleSheet(f"background:{T['bg_panel']}; border-bottom:1px solid {T['border']};")
+        ah = QHBoxLayout(act_hdr); ah.setContentsMargins(12,6,12,6)
+        ah.addWidget(QLabel("ACTIONS"))
+        self.sel_pill = QLabel(f"{len(self.list_col.selected)} selected"); self.sel_pill.setObjectName("Pill")
+        ah.addWidget(self.sel_pill); ah.addStretch(1)
+        af.addWidget(act_hdr)
+
+        grid_w = QWidget()
+        grid = QGridLayout(grid_w); grid.setContentsMargins(10,8,10,8); grid.setSpacing(6)
+        for c in range(4): grid.setColumnStretch(c, 1)
+        for bid, label, kind, row, col in self._BUTTON_GRID:
+            btn = QPushButton(label)
+            if kind: btn.setProperty(kind, True)
+            btn.style().unpolish(btn); btn.style().polish(btn)
+            btn.clicked.connect(lambda _, b=bid, l=label: self._fire(b, l))
+            grid.addWidget(btn, row, col)
+        af.addWidget(grid_w)
+        root.addWidget(actions)
+
+        QTimer.singleShot(0, self._refresh_list)
+
+    def _on_sel(self, sel):
+        self.sel_pill.setText(f"{len(sel)} selected")
+
+    def _selected_windows(self) -> list[MBotWindow]:
+        sel_ids = set(self.list_col.selected)
+        return [w for w, m in zip(_live_windows, _live_mbots) if m.id in sel_ids]
+
+    def _do_scan(self):
+        global _live_windows, _live_mbots
+        if not WIN32_AVAILABLE:
+            self.log_event.emit("win32/pywinauto not available — cannot scan mBot windows", "err")
+            return
+        try:
+            all_32770 = findwindows.find_elements(class_name="#32770", visible_only=False)
+            self.log_event.emit(f"Found {len(all_32770)} total #32770 windows", "info")
+            for el in all_32770[:5]:
+                self.log_event.emit(f"  Window: '{el.name}'", "info")
+        except Exception as ex:
+            self.log_event.emit(f"Error scanning windows: {ex}", "err"); return
+        _live_windows = scan_mbot_windows()
+        _live_mbots   = []
+        for i, w in enumerate(_live_windows):
+            char, is_dc = _parse_char_name(w.mbot.name)
+            _live_mbots.append(MbotInfo(id=i+1, window_name=w.mbot.name, char=char, is_dc=is_dc))
+        self._known_names = sorted(w.mbot.name for w in _live_windows if w.mbot.name)
+        self._rebuild_ui()
+        if callable(getattr(self, "_on_scan_done", None)):
+            self._on_scan_done()
+        self.log_event.emit(f"Refresh done — {len(_live_mbots)} mBots matched", "ok")
+
+    def _rebuild_ui(self):
+        self.list_col.reload()
+        while self._char_layout.count():
+            item = self._char_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self._char_cards.clear()
+        for m in _live_mbots:
+            card = CharCard(m)
+            self._char_cards[m.id] = card
+            self._char_layout.addWidget(card)
+        self._char_layout.addStretch(1)
+        online = sum(1 for m in _live_mbots if not m.is_dc)
+        self.char_pill.setText(f"{online} online")
+        if self._dc_pending_next:
+            cb = self._dc_pending_next; self._dc_pending_next = None
+            QTimer.singleShot(1000, cb)
+
+    def _refresh_list(self):
+        self._do_scan()
+
+    def _fire(self, bid: str, label: str):
+        sel   = self._selected_windows()
+        names = ", ".join(m.char for m in _live_mbots if m.id in self.list_col.selected) or "(none)"
+        kind  = "warn" if (bid.startswith("kill") or bid == "stopTrain") else (
+                "ok"   if bid.startswith("start") else "info")
+
+        if bid == "refresh":
+            self._refresh_list(); return
+        if not sel:
+            self.log_event.emit(f"{label} — no mBots selected", "warn"); return
+
+        if bid == "killBot":
+            if QMessageBox.question(None, "Confirm", f"Close mBot(s): {names}?") != QMessageBox.StandardButton.Yes: return
+            self.process_mbots(sel, [(0, lambda m: m.kill_mbot())])
+            QTimer.singleShot(2000, self._refresh_list)
+        elif bid == "killClient":
+            if QMessageBox.question(None, "Confirm", f"Kill client(s): {names}?") != QMessageBox.StandardButton.Yes: return
+            self.process_mbots(sel, [(0, lambda m: m.kill_client())])
+        elif bid == "showHide":
+            self.process_mbots(sel, [(0, lambda m: m.show_hide_mbot())])
+        elif bid == "showHideCli":
+            self.process_mbots(sel, [(0, lambda m: m.show_hide_client())])
+        elif bid == "startClient":
+            self.process_mbots(sel, [(0, lambda m: m.start_client())])
+        elif bid == "logoff":
+            self.process_mbots(sel, [(0, lambda m: m.log_off())])
+        elif bid == "reset":
+            self.process_mbots(sel, [(0, lambda m: m.reset_mbot())])
+        elif bid == "getPos":
+            self.process_mbots(sel, [(0, lambda m: m.get_current_position())])
+        elif bid == "startTrain":
+            self.process_mbots(sel, [(0, lambda m: m.start_training())])
+        elif bid == "stopTrain":
+            self.process_mbots(sel, [(0, lambda m: m.stop_training())])
+
+        self.log_event.emit(f"{label} → {names}", kind)
+
+
+# ---------------------------------------------------------------------------
+# Account
+# ---------------------------------------------------------------------------
+
+class AccountPanel(ProcessMbotsMixin, QWidget):
+    log_event = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self._item_changed_connected = False
+        self.pending_login: tuple = ()
+
+        root = QVBoxLayout(self); root.setContentsMargins(16,14,16,14); root.setSpacing(12)
+
+        # Header
+        head = QHBoxLayout(); head.setSpacing(12)
+        text_col = QVBoxLayout(); text_col.setSpacing(2)
+        text_col.addWidget(QLabel("Accounts", objectName="PanelTitle"))
+        self.sub_label = QLabel(); self.sub_label.setObjectName("PanelSub")
+        text_col.addWidget(self.sub_label)
+        head.addLayout(text_col, 1)
+        login_btn = QPushButton("  Login selected  ")
+        login_btn.setProperty("primary", True); login_btn.style().unpolish(login_btn); login_btn.style().polish(login_btn)
+        login_btn.setFixedHeight(32); login_btn.clicked.connect(self._login_selected)
+        head.addWidget(login_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(head)
+
+        # Toolbar
+        tb = QHBoxLayout(); tb.setSpacing(6)
+        sa = QPushButton("Select all");      sa.clicked.connect(self._select_all)
+        ca = QPushButton("Clear all");       ca.clicked.connect(self._clear_all)
+        rm = QPushButton("Remove selected"); rm.setProperty("danger", True)
+        rm.style().unpolish(rm); rm.style().polish(rm)
+        rm.clicked.connect(self._remove_selected)
+        self.sel_pill = QLabel("0 selected"); self.sel_pill.setObjectName("Pill")
+        tb.addWidget(sa); tb.addWidget(ca); tb.addWidget(rm); tb.addStretch(1); tb.addWidget(self.sel_pill)
+        root.addLayout(tb)
+
+        # Table
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["", "#", "Username", "Character", "mBot file path"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setShowGrid(False)
+        h = self.table.horizontalHeader()
+        for i, mode in enumerate([
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.Stretch,
+        ]): h.setSectionResizeMode(i, mode)
+        self.table.setMinimumHeight(220)
+        root.addWidget(self.table)
+        self._refresh_table()
+
+        # Add-account card — wrapped in scroll so buttons stay visible at small heights
+        # Add-account card — 2-column compact layout, no scroll needed
+        card = QFrame(); card.setObjectName("SignupCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(12,10,12,10); cl.setSpacing(6)
+
+        title_row = QHBoxLayout(); title_row.setSpacing(8)
+        title_row.addWidget(QLabel("Add account", styleSheet="font-size:12px; font-weight:600;"))
+        title_row.addStretch(1)
+        cl.addLayout(title_row)
+
+        self.in_user = QLineEdit(placeholderText="Username")
+        self.in_pass = QLineEdit(placeholderText="Password")
+        self.in_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.in_char = QLineEdit(placeholderText="Character (exact, case-sensitive)")
+        self.in_path = QLineEdit(placeholderText=r"C:\MBot\mbot.exe")
+        browse_btn = QPushButton("Browse…"); browse_btn.clicked.connect(self._browse_mbot)
+        browse_btn.setFixedWidth(70)
+
+        # Row 1: Username | Password
+        r1 = QHBoxLayout(); r1.setSpacing(8)
+        r1.addWidget(self.in_user, 1); r1.addWidget(self.in_pass, 1)
+        cl.addLayout(r1)
+
+        # Row 2: Character | mBot path + Browse
+        r2 = QHBoxLayout(); r2.setSpacing(8)
+        r2.addWidget(self.in_char, 1); r2.addWidget(self.in_path, 1); r2.addWidget(browse_btn)
+        cl.addLayout(r2)
+
+        # Row 3: buttons
+        r3 = QHBoxLayout(); r3.setSpacing(6)
+        add_btn = QPushButton("Add account"); add_btn.setProperty("primary", True)
+        add_btn.style().unpolish(add_btn); add_btn.style().polish(add_btn)
+        add_btn.clicked.connect(self._add)
+        clr_btn = QPushButton("Clear"); clr_btn.clicked.connect(self._clear_form)
+        r3.addWidget(add_btn); r3.addWidget(clr_btn); r3.addStretch(1)
+        cl.addLayout(r3)
+
+        root.addWidget(card)
+
+    def _refresh_table(self):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(_accounts))
+        for i, a in enumerate(_accounts):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            chk.setData(Qt.ItemDataRole.UserRole, i)
+            self.table.setItem(i, 0, chk)
+            self.table.setItem(i, 1, QTableWidgetItem(str(i+1)))
+            self.table.setItem(i, 2, QTableWidgetItem(a.get("username", "")))
+            self.table.setItem(i, 3, QTableWidgetItem(a.get("character", "")))
+            path_it = QTableWidgetItem(a.get("mbot_file_path", ""))
+            path_it.setForeground(QColor(T['text_dim']))
+            path_it.setToolTip(a.get("mbot_file_path", ""))
+            self.table.setItem(i, 4, path_it)
+
+        self.table.blockSignals(False)
+        self.table.resizeRowsToContents()
+        if not self._item_changed_connected:
+            self.table.itemChanged.connect(lambda it: it.column() == 0 and self._update_pill())
+            self._item_changed_connected = True
+        self._update_pill()
+        self.sub_label.setText(f"{len(_accounts)} saved accounts. Each is bound to a .mbot profile file.")
+
+    def _update_pill(self):
+        n = sum(1 for r in range(self.table.rowCount())
+                if (it := self.table.item(r, 0)) and it.checkState() == Qt.CheckState.Checked)
+        self.sel_pill.setText(f"{n} selected")
+
+    def _select_all(self):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it: it.setCheckState(Qt.CheckState.Checked)
+        self.table.blockSignals(False); self._update_pill()
+
+    def _clear_all(self):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it: it.setCheckState(Qt.CheckState.Unchecked)
+        self.table.blockSignals(False); self._update_pill()
+
+    def _remove_selected(self):
+        indices = self._selected_indices()
+        if not indices:
+            return
+        names = ", ".join(_accounts[i]["username"] for i in indices if i < len(_accounts))
+        if QMessageBox.question(self, "Confirm", f"Delete {len(indices)} account(s): {names}?") != QMessageBox.StandardButton.Yes:
+            return
+        for i in sorted(indices, reverse=True):
+            if i < len(_accounts):
+                _accounts.pop(i)
+        save_accounts()
+        self._refresh_table()
+        self.log_event.emit(f"Removed {len(indices)} account(s)", "warn")
+
+    def _selected_indices(self) -> list[int]:
+        return [
+            self.table.item(r, 0).data(Qt.ItemDataRole.UserRole)
+            for r in range(self.table.rowCount())
+            if (it := self.table.item(r, 0)) and it.checkState() == Qt.CheckState.Checked
+        ]
+
+    # ── Login sequence ────────────────────────────────────────────────────
+    def _login_selected(self):
+        indices = self._selected_indices()
+        if not indices:
+            QMessageBox.information(self, "No selection", "Please select at least one account to log in.")
+            return
+        names = ", ".join(_accounts[i]["username"] for i in indices if i < len(_accounts))
+        self.log_event.emit(f"Starting login sequence → {names}", "ok")
+        if WIN32_AVAILABLE:
+            self.pending_login = tuple(indices)
+            self._start_mbot_client(0)
+        else:
+            self.log_event.emit("Win32 not available — login sequence skipped (not on Windows)", "warn")
+
+    def _ensure_firewall(self, exe_path: str, username: str) -> None:
+        rule_name = f"{username}_{os.path.basename(exe_path)}"
+        try:
+            check = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+                capture_output=True, text=True)
+            if check.returncode == 0 and "No rules match" not in check.stdout:
+                self.log_event.emit(f"Firewall rule already exists for {rule_name}", "info"); return
+            subprocess.run([
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={rule_name}", "dir=in", "action=allow",
+                f"program={exe_path}", "profile=public", "enable=yes",
+            ], capture_output=True)
+            self.log_event.emit(f"Firewall rule added for {rule_name} (Public inbound)", "ok")
+        except Exception as e:
+            self.log_event.emit(f"Firewall setup failed: {e}", "warn")
+
+    def _start_mbot_client(self, index: int) -> None:
+        if index >= len(self.pending_login): return
+        idx = self.pending_login[index]
+        if idx >= len(_accounts): return
+        acc      = _accounts[idx]
+        username = acc["username"]
+        for title in [f"[{username}] mBot v1.12b (vSRO 110)",
+                      f"[{username} - DC] mBot v1.12b (vSRO 110)"]:
+            if findwindows.find_elements(class_name="#32770", title=title, visible_only=False):
+                self.log_event.emit(f"mBot already open for {username}, skipping", "info")
+                QTimer.singleShot(1000, lambda: self._start_mbot_client(index + 1)); return
+        mbot_path = acc.get("mbot_file_path", "")
+        if not mbot_path or not os.path.exists(mbot_path):
+            self.log_event.emit(f"mBot path not found for {username}: {mbot_path}", "err")
+            QTimer.singleShot(500, lambda: self._start_mbot_client(index + 1)); return
+        folder   = os.path.normpath(os.path.dirname(mbot_path))
+        vsro_exe = os.path.join(folder, "mBot_vSRO110.exe")
+        if os.path.exists(vsro_exe):
+            self._ensure_firewall(vsro_exe, username)
+        subprocess.Popen(mbot_path, cwd=folder)
+        self.log_event.emit(f"Launched mBot for {username}", "info")
+        QTimer.singleShot(3000, lambda: self._start_client_sro(index))
+
+    def _start_client_sro(self, index: int) -> None:
+        username  = _accounts[self.pending_login[index]]["username"]
+        mbot_list = findwindows.find_elements(class_name="#32770", title="mBot v1.12b (vSRO 110)")
+        if not mbot_list:
+            QTimer.singleShot(1000, lambda: self._start_client_sro(index)); return
+        MBotWindow(mbot_list[0]).start_client()
+        self.log_event.emit(f"Start Client sent for {username}", "info")
+        QTimer.singleShot(10_000, lambda: self._login_sro(index))
+
+    def _login_sro(self, index: int) -> None:
+        windows = findwindows.find_elements(class_name="CLIENT", title="SRO_Client")
+        if not windows:
+            QTimer.singleShot(2000, lambda: self._login_sro(index)); return
+        handle = windows[0].handle
+        ctypes.windll.user32.ShowWindow(handle, 5)
+        win32gui.SetWindowPos(handle, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+        left, top, right, bottom = win32gui.GetWindowRect(handle)
+        cx = left + (right - left) // 2
+        cy = top  + (bottom - top) // 2
+        QTimer.singleShot(2000, lambda: self._login_click_center(index, cx, cy))
+
+    def _login_click_center(self, index, cx, cy):
+        auto.Click(cx, cy)
+        QTimer.singleShot(2000, lambda: self._login_click_server(index, cx, cy))
+
+    def _login_click_server(self, index, cx, cy):
+        auto.Click(cx, cy - 125)
+        QTimer.singleShot(2000, lambda: self._login_choose_server(index, cx, cy))
+
+    def _login_choose_server(self, index, cx, cy):
+        auto.Click(cx - 50, cy + 200)
+        QTimer.singleShot(1500, lambda: self._login_enter_credentials(index))
+
+    def _login_enter_credentials(self, index: int) -> None:
+        acc      = _accounts[self.pending_login[index]]
+        username = acc["username"]
+        password = base64.b64decode(acc["password"]).decode("utf-8")
+        for key in ('{Tab}', username, '{Tab}', password, '{Enter}'):
+            auto.SendKeys(key, interval=0.08)
+        self.log_event.emit(f"Credentials sent for {username}", "ok")
+        QTimer.singleShot(15_000, lambda: self._start_training_sro(index))
+
+    def _start_training_sro(self, index: int) -> None:
+        acc       = _accounts[self.pending_login[index]]
+        character = acc.get("character", acc["username"])
+        windows   = findwindows.find_elements(class_name="CLIENT", title=character)
+        if not windows:
+            QTimer.singleShot(5000, lambda: self._start_training_sro(index)); return
+        win32gui.SetWindowPos(windows[0].handle, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+        mbot_list = findwindows.find_elements(class_name="#32770",
+                                              title=f"[{character}] mBot v1.12b (vSRO 110)")
+        if mbot_list:
+            MBotWindow(mbot_list[0]).start_training()
+        QTimer.singleShot(5000, lambda: self._hide_and_next(index))
+
+    def _hide_and_next(self, index: int) -> None:
+        acc       = _accounts[self.pending_login[index]]
+        character = acc.get("character", acc["username"])
+        mbot_list = findwindows.find_elements(class_name="#32770",
+                                              title=f"[{character}] mBot v1.12b (vSRO 110)")
+        if mbot_list:
+            self.process_mbots([MBotWindow(mbot_list[0])], [
+                (0,   lambda m: m.start_training()),
+                (100, lambda m: m.show_hide_client()),
+                (100, lambda m: m.show_hide_mbot()),
+            ])
+        self.log_event.emit(f"Login complete for {character}", "ok")
+        QTimer.singleShot(2000, lambda: self._start_mbot_client(index + 1))
+
+    # ── CRUD ──────────────────────────────────────────────────────────────
+    def _browse_mbot(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select mBot executable", "",
+            "Applications (*.exe);;All files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog)
+        if path: self.in_path.setText(os.path.normpath(path))
+
+    def _add(self):
+        u    = self.in_user.text().strip()
+        p    = self.in_pass.text().strip()
+        char = self.in_char.text().strip()
+        path = self.in_path.text().strip()
+        if not u or not p:
+            QMessageBox.warning(self, "Missing fields", "Username and password are required."); return
+        if not char:
+            QMessageBox.warning(self, "Missing fields", "Character name is required."); return
+        if any(a["username"] == u for a in _accounts):
+            QMessageBox.critical(self, "Error", "Username already exists!"); return
+        _accounts.append({
+            "username": u,
+            "password": base64.b64encode(p.encode()).decode(),
+            "character": char,
+            "mbot_file_path": path,
+        })
+        save_accounts()
+        self._refresh_table()
+        self.log_event.emit(f"Added account '{u}' ({char})", "ok")
+        self._clear_form()
+
+    def _clear_form(self):
+        for w in (self.in_user, self.in_pass, self.in_char, self.in_path):
+            w.clear()
+
+    def _remove(self, idx):
+        if idx >= len(_accounts): return
+        name = _accounts[idx]["username"]
+        if QMessageBox.question(self, "Confirm", f"Delete account '{name}'?") != QMessageBox.StandardButton.Yes: return
+        _accounts.pop(idx)
+        save_accounts()
+        self._refresh_table()
+        self.log_event.emit(f"Removed account '{name}'", "warn")
+
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
+
+class ChatPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.active_ch   = "Allchat"
+        self.tab_buttons: dict[str, QPushButton] = {}
+        self._chat_timer: QTimer | None = None
+
+        root = QHBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+
+        self.list_col = MbotListColumn(multi=False, initial_focus=None)
+        self.list_col.focus_changed.connect(self._on_focus_changed)
+        root.addWidget(self.list_col)
+
+        right = QFrame(); right.setObjectName("Col")
+        rl = QVBoxLayout(right); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+
+        # Header
+        hdr = QFrame()
+        hdr.setStyleSheet(f"background:{T['bg_deep']}; border-bottom:1px solid {T['border']};")
+        hh = QHBoxLayout(hdr); hh.setContentsMargins(12,8,12,8)
+        hh.addWidget(QLabel("CHAT")); hh.addStretch(1)
+        self.chat_pill = QLabel("—"); self.chat_pill.setObjectName("Pill")
+        hh.addWidget(self.chat_pill)
+        rl.addWidget(hdr)
+
+        # Channel tabs
+        tabs = QFrame()
+        tabs.setStyleSheet(f"background:{T['bg_deep']}; border-bottom:1px solid {T['border']};")
+        tw = QHBoxLayout(tabs); tw.setContentsMargins(10,8,10,8); tw.setSpacing(4)
+        for ch in CHAT_BUTTON_TEXTS:
+            b = QPushButton(ch); b.setObjectName("ChatTab")
+            b.setProperty("active", ch == self.active_ch)
+            b.style().unpolish(b); b.style().polish(b)
+            b.clicked.connect(lambda _, c=ch: self._set_channel(c))
+            self.tab_buttons[ch] = b; tw.addWidget(b)
+        tw.addStretch(1)
+        rl.addWidget(tabs)
+
+        self.stream = QPlainTextEdit(); self.stream.setObjectName("ChatStream")
+        self.stream.setReadOnly(True)
+        rl.addWidget(self.stream, 1)
+        root.addWidget(right, 1)
+
+    def _focused_window(self) -> MBotWindow | None:
+        fid = self.list_col.focused
+        return next((w for w, m in zip(_live_windows, _live_mbots) if m.id == fid), None)
+
+    def _on_focus_changed(self, mid):
+        self.chat_pill.setText(next((m.char for m in _live_mbots if m.id == mid), "—"))
+        self._start_chat_poll()
+
+    def _set_channel(self, ch):
+        self.active_ch = ch
+        for c, b in self.tab_buttons.items():
+            b.setProperty("active", c == ch)
+            b.style().unpolish(b); b.style().polish(b)
+        self._start_chat_poll()
+
+    def _start_chat_poll(self):
+        if self._chat_timer: self._chat_timer.stop()
+        self._do_poll()
+
+    def _do_poll(self):
+        w = self._focused_window()
+        if w:
+            content = w.get_chat_content(self.active_ch)
+            if content is not None and self.stream.toPlainText() != content:
+                self.stream.setPlainText(content)
+                self.stream.verticalScrollBar().setValue(self.stream.verticalScrollBar().maximum())
+        self._chat_timer = QTimer(self)
+        self._chat_timer.setSingleShot(True)
+        self._chat_timer.timeout.connect(self._do_poll)
+        self._chat_timer.start(20_000)
+
+
+# ---------------------------------------------------------------------------
+# Inventory
+# ---------------------------------------------------------------------------
+
+class InventoryPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        root = QHBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+
+        self.list_col = MbotListColumn(multi=False, initial_focus=1)
+        self.list_col.focus_changed.connect(self._refresh)
+        root.addWidget(self.list_col)
+
+        right = QFrame(); right.setObjectName("Col")
+        rl = QVBoxLayout(right); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+
+        hdr = QFrame()
+        hdr.setStyleSheet(f"background:{T['bg_deep']}; border-bottom:1px solid {T['border']};")
+        hh = QHBoxLayout(hdr); hh.setContentsMargins(12,8,12,8)
+        hh.addWidget(QLabel("INVENTORY & LOG")); hh.addStretch(1)
+        self.head_pill = QLabel("—"); self.head_pill.setObjectName("Pill")
+        hh.addWidget(self.head_pill)
+        rl.addWidget(hdr)
+
+        # 3-column body
+        body_layout = QHBoxLayout(); body_layout.setContentsMargins(0,0,0,0); body_layout.setSpacing(0)
+
+        # Inventory column
+        inv_wrap = QFrame()
+        inv_wrap.setStyleSheet(f"background:{T['bg_window']}; border-right:1px solid {T['border']};")
+        iv = QVBoxLayout(inv_wrap); iv.setContentsMargins(0,0,0,0); iv.setSpacing(0)
+        inv_hdr = QFrame()
+        inv_hdr.setStyleSheet(f"background:{T['bg_panel']}; border-bottom:1px solid {T['border']};")
+        ih = QHBoxLayout(inv_hdr); ih.setContentsMargins(10,5,10,5); ih.setSpacing(8)
+        inv_title = QLabel("INVENTORY")
+        inv_title.setStyleSheet(f"color:{T['text_dim']};font-weight:600;font-size:10px;letter-spacing:0.5px;")
+        self.inv_combo = QComboBox(); self.inv_combo.addItems(INVENTORY_OPTIONS)
+        self.inv_combo.setCurrentText("Inventory"); self.inv_combo.setFixedWidth(110)
+        self.inv_combo.currentTextChanged.connect(self._refresh)
+        ih.addWidget(inv_title); ih.addStretch(1); ih.addWidget(self.inv_combo)
+        iv.addWidget(inv_hdr)
+        self.inv_log = QPlainTextEdit(); self.inv_log.setObjectName("InvLog"); self.inv_log.setReadOnly(True)
+        iv.addWidget(self.inv_log, 1)
+        body_layout.addWidget(inv_wrap, 1)
+
+        # Active buffs column
+        self.buff_col = self._plain_column("ACTIVE BUFFS")
+        body_layout.addWidget(self.buff_col["wrap"], 1)
+
+        # Event log column
+        ev_wrap = QFrame()
+        ev_wrap.setStyleSheet(f"background:{T['bg_window']}; border-right:1px solid {T['border']};")
+        ev = QVBoxLayout(ev_wrap); ev.setContentsMargins(0,0,0,0); ev.setSpacing(0)
+        ev_hdr = QFrame()
+        ev_hdr.setStyleSheet(f"background:{T['bg_panel']}; border-bottom:1px solid {T['border']};")
+        eh = QHBoxLayout(ev_hdr); eh.setContentsMargins(10,5,10,5); eh.setSpacing(10)
+        ev_title = QLabel("EVENT LOG")
+        ev_title.setStyleSheet(f"color:{T['text_dim']};font-weight:600;font-size:10px;letter-spacing:0.5px;")
+        ev_clr = QPushButton("Clear"); ev_clr.setFixedHeight(20)
+        ev_clr.setStyleSheet("padding:1px 8px; font-size:10px;")
+        ev_clr.clicked.connect(lambda: self.ev_log.clear())
+        eh.addWidget(ev_title); eh.addStretch(1); eh.addWidget(ev_clr)
+        ev.addWidget(ev_hdr)
+        self.ev_log = QPlainTextEdit(); self.ev_log.setObjectName("InvLog"); self.ev_log.setReadOnly(True)
+        ev.addWidget(self.ev_log, 1)
+        body_layout.addWidget(ev_wrap, 1)
+
+        body_w = QWidget(); body_w.setLayout(body_layout)
+        rl.addWidget(body_w, 1)
+        root.addWidget(right, 1)
+        self._refresh()
+
+    @staticmethod
+    def _plain_column(title: str) -> dict:
+        wrap = QFrame()
+        wrap.setStyleSheet(f"background:{T['bg_window']}; border-right:1px solid {T['border']};")
+        v = QVBoxLayout(wrap); v.setContentsMargins(0,0,0,0); v.setSpacing(0)
+        hdr = QLabel(title)
+        hdr.setStyleSheet(
+            f"background:{T['bg_panel']};color:{T['text_dim']};"
+            f"border-bottom:1px solid {T['border']};"
+            f"padding:6px 12px;font-weight:600;font-size:10px;letter-spacing:0.5px;")
+        v.addWidget(hdr)
+        log = QPlainTextEdit(); log.setObjectName("InvLog"); log.setReadOnly(True)
+        v.addWidget(log, 1)
+        return {"wrap": wrap, "log": log}
+
+    def _refresh(self, *_):
+        focus_id = self.list_col.focused
+        focus_m  = next((m for m in _live_mbots if m.id == focus_id), None)
+        focus_w  = next((w for w, m in zip(_live_windows, _live_mbots) if m.id == focus_id), None)
+        self.head_pill.setText(focus_m.char if focus_m else "—")
+
+        inv_type = self.inv_combo.currentText()
+        inv_idx  = INVENTORY_OPTIONS.index(inv_type) if inv_type in INVENTORY_OPTIONS else 3
+        inv_html = [f"<div style='margin-bottom:4px'><span style='color:{T['accent']};font-size:10px;"
+                    f"font-weight:600;'>[{inv_type}]</span></div>"]
+
+        if focus_w:
+            focus_w.set_inventory_combo(inv_idx)
+            focus_w.refresh_inventory()
+            raw_items = focus_w.get_inventory_items()
+            totals: dict[str, int] = defaultdict(int)
+            slots:  dict[str, int] = defaultdict(int)
+            for line in raw_items:
+                m = re.search(r':\s*(.*?)\s*\((\d+)\s+pieces\)', line)
+                if m:
+                    totals[m.group(1)] += int(m.group(2))
+                    slots[m.group(1)]  += 1
+            if totals:
+                for item in sorted(totals):
+                    inv_html.append(
+                        f"<div><span style='color:{T['text']}'>{item}</span>"
+                        f"<span style='color:{T['text_mute']}'> — </span>"
+                        f"<span style='color:{T['accent']};font-family:monospace'>{totals[item]}</span>"
+                        f"<span style='color:{T['text_mute']}'>pcs / {slots[item]} slots</span></div>"
+                    )
+            else:
+                inv_html.append(f"<div style='color:{T['text_mute']}'>No stackable items found.</div>")
+        else:
+            inv_html.append(f"<div style='color:{T['text_mute']}'>No mBot selected or not running.</div>")
+
+        self.inv_log.clear(); self.inv_log.appendHtml("".join(inv_html))
+
+        # Buffs
+        buff_html = []
+        if focus_w:
+            focus_w.set_spy_player_checkbox_state()
+            focus_w.refresh_spy()
+            buffs = focus_w.get_active_buffs()
+            buff_html = (
+                [f"<div style='color:{T['accent']}'>{b}</div>" for b in buffs]
+                if buffs else
+                [f"<div style='color:{T['text_mute']}'>No buffs found.</div>"]
+            )
+        else:
+            buff_html = [f"<div style='color:{T['text_mute']}'>No mBot selected.</div>"]
+        self.buff_col["log"].clear(); self.buff_col["log"].appendHtml("".join(buff_html))
+
+        # Event log
+        if focus_w:
+            raw = focus_w.get_log() or ""
+            ev_html = [f"<div style='color:{T['text_dim']}'>{line}</div>"
+                       for line in raw.splitlines() if line.strip()]
+            self.ev_log.clear()
+            self.ev_log.appendHtml("".join(ev_html) if ev_html
+                                   else f"<div style='color:{T['text_mute']}'>No log entries.</div>")
+        else:
+            self.ev_log.clear()
+            self.ev_log.appendHtml(f"<div style='color:{T['text_mute']}'>No mBot selected.</div>")
+
+
+
+# ---------------------------------------------------------------------------
+# Log
+# ---------------------------------------------------------------------------
+
+class LogPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+
+        hdr = QFrame()
+        hdr.setStyleSheet(f"background:{T['bg_panel']}; border-bottom:1px solid {T['border']};")
+        lh = QHBoxLayout(hdr); lh.setContentsMargins(12,6,12,6)
+        lh.addWidget(QLabel("LOG", styleSheet=f"color:{T['text_dim']};font-weight:600;font-size:10px;letter-spacing:0.5px;"))
+        self.log_count = QLabel("0 entries"); self.log_count.setObjectName("Pill")
+        clr_btn = QPushButton("Clear"); clr_btn.clicked.connect(self.clear)
+        lh.addWidget(self.log_count); lh.addStretch(1); lh.addWidget(clr_btn)
+        root.addWidget(hdr)
+
+        self.log = QPlainTextEdit(); self.log.setObjectName("Log"); self.log.setReadOnly(True)
+        root.addWidget(self.log, 1)
+
+    def append(self, msg: str, kind: str = "info", who: Optional[str] = None):
+        colors = {
+            "info": T['text_dim'], "ok": T['success'], "warn": T['warn'],
+            "err":  T['danger'],   "accent": T['accent'],
+        }
+        color    = colors.get(kind, T['text_dim'])
+        prefix   = f"<span style='color:{T['text_mute']}'>[{now_ts()}]</span> "
+        who_html = f"<span style='color:{T['accent']}'>{who}:</span> " if who else ""
+        self.log.appendHtml(f"{prefix}{who_html}<span style='color:{color}'>{msg}</span>")
+        n = int(self.log_count.text().split()[0]) + 1
+        self.log_count.setText(f"{n} entries")
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def clear(self):
+        self.log.clear(); self.log_count.setText("0 entries")
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class MainWindow(ProcessMbotsMixin, QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MBot Manager")
+        self.resize(900, 620)
+        self.setStyleSheet(make_stylesheet(DARK))
+        self._known_names: list[str] = []
+
+        central = QWidget(); self.setCentralWidget(central)
+        root = QVBoxLayout(central); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+
+        # Title bar
+        title_bar = QFrame(); title_bar.setObjectName("TitleBar"); title_bar.setFixedHeight(32)
+        tb = QHBoxLayout(title_bar); tb.setContentsMargins(12,0,0,0); tb.setSpacing(8)
+        self.title_text = QLabel()
+        tb.addWidget(self.title_text); tb.addStretch(1)
+        root.addWidget(title_bar)
+        self._update_title(0)
+
+        # Main row: sidebar + content
+        main = QHBoxLayout(); main.setContentsMargins(0,0,0,0); main.setSpacing(0)
+
+        sidebar = QFrame(); sidebar.setObjectName("Sidebar"); sidebar.setFixedWidth(96)
+        sl = QVBoxLayout(sidebar); sl.setContentsMargins(0,4,0,0); sl.setSpacing(0)
+
+        self.stack = QStackedWidget()
+        self.dash  = DashboardPanel()
+        self.acc   = AccountPanel()
+        self.chat  = ChatPanel()
+        self.inv   = InventoryPanel()
+        self.log_panel = LogPanel()
+        for w in (self.dash, self.acc, self.chat, self.inv, self.log_panel):
+            self.stack.addWidget(w)
+        self.dash.log_event.connect(self._append_log)
+        self.acc.log_event.connect(self._append_log)
+
+        def _on_scan_done():
+            self.chat.list_col.reload()
+            self.inv.list_col.reload()
+        self.dash._on_scan_done = _on_scan_done
+
+        self.nav_buttons: list[QPushButton] = []
+        for i, label in enumerate(["Dashboard","Account","Chat","Inventory","Log"]):
+            b = QPushButton(label); b.setObjectName("NavItem")
+            b.setProperty("active", i == 0)
+            b.style().unpolish(b); b.style().polish(b)
+            b.clicked.connect(lambda _, idx=i: self._switch(idx))
+            sl.addWidget(b); self.nav_buttons.append(b)
+        sl.addStretch(1)
+        main.addWidget(sidebar)
+
+        right = QFrame()
+        rl = QVBoxLayout(right); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+        rl.addWidget(self.stack, 1)
+
+
+        main.addWidget(right, 1)
+        root.addLayout(main, 1)
+
+        # Initial messages
+        self._append_log("Welcome to MBot Manager v0.1.0", "accent")
+        self._append_log(f"Loaded {len(_accounts)} accounts from {ACCOUNTS_FILE}", "info")
+        if not WIN32_AVAILABLE:
+            self._append_log("win32/pywinauto not available — running in UI-only mode", "warn")
+
+        # HP/MP/KPH poll every 1 s
+        self._hp_mp_timer = QTimer(self)
+        self._hp_mp_timer.timeout.connect(self._poll_hp_mp)
+        self._hp_mp_timer.start(1000)
+
+        # Window change detection every 60 s
+        self._scan_timer = QTimer(self)
+        self._scan_timer.timeout.connect(self._scan_if_changed)
+        self._scan_timer.start(60_000)
+
+    def _update_title(self, online: int):
+        self.title_text.setText(
+            f"<b>MBot Manager</b> <span style='color:{T['text_mute']}'>v0.1.0</span>"
+            f"  <span style='background:rgba(0,0,0,0.2);padding:2px 8px;border-radius:3px;'>"
+            f"<span style='color:{T['success']}'>●</span> {online} mBots online</span>"
+        )
+
+    def _scan_if_changed(self):
+        if not WIN32_AVAILABLE: return
+        global _live_windows, _live_mbots
+        try:
+            new_windows = scan_mbot_windows()
+        except Exception as e:
+            self._append_log(f"[scan] error: {e}", "err"); return
+        new_names = sorted(w.mbot.name for w in new_windows if w.mbot.name)
+        if new_names == self._known_names: return
+        self._known_names = new_names[:]     # store a copy to avoid aliasing
+        _live_windows = new_windows
+        _live_mbots   = []
+        for i, w in enumerate(_live_windows):
+            char, is_dc = _parse_char_name(w.mbot.name)
+            _live_mbots.append(MbotInfo(id=i+1, window_name=w.mbot.name, char=char, is_dc=is_dc))
+        self.dash._rebuild_ui()
+        self.chat.list_col.reload()
+        self.inv.list_col.reload()
+
+    def _poll_hp_mp(self):
+        if not _live_windows: return
+        changed = False
+        for w, m in zip(_live_windows, _live_mbots):
+            try:
+                hp  = w.get_hp();  kph = w.get_kills_per_hour(); mp = w.get_mp()
+                if hp  is not None: m.hp  = hp;  changed = True
+                if mp  is not None: m.mp  = mp;  changed = True
+                if kph:             m.kph = kph; changed = True
+            except Exception as e:
+                self._append_log(f"Poll error [{m.char}]: {e}", "err")
+        if changed:
+            for mid, card in self.dash._char_cards.items():
+                mbot = next((x for x in _live_mbots if x.id == mid), None)
+                if mbot: card.refresh(mbot)
+            self._update_title(sum(1 for m in _live_mbots if not m.is_dc))
+
+    def _switch(self, idx):
+        self.stack.setCurrentIndex(idx)
+        for i, b in enumerate(self.nav_buttons):
+            b.setProperty("active", i == idx)
+            b.style().unpolish(b); b.style().polish(b)
+
+    def _append_log(self, msg: str, kind: str = "info", who: Optional[str] = None):
+        self.log_panel.append(msg, kind, who)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    global _accounts, _live_windows, _live_mbots
+
+    import traceback as _tb
+    def _excepthook(exc_type, exc_val, exc_tb):
+        msg = "".join(_tb.format_exception(exc_type, exc_val, exc_tb))
+        print(msg, file=sys.__stderr__)
+        try:
+            with open("crash.log", "a") as f: f.write(msg + "\n")
+        except Exception:
+            pass
+    sys.excepthook = _excepthook
+
+    autologin = "--autologin" in sys.argv
+    os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+
+    _accounts     = load_accounts()
+    app           = QApplication(sys.argv)
+    init_win32_modules()
+    app.setStyle("Fusion")
+
+    pal = app.palette()
+    pal.setColor(QPalette.ColorRole.Window,     QColor(T['bg_window']))
+    pal.setColor(QPalette.ColorRole.Base,       QColor(T['bg_input']))
+    pal.setColor(QPalette.ColorRole.Text,       QColor(T['text']))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(T['text']))
+    pal.setColor(QPalette.ColorRole.Button,     QColor(T['bg_panel']))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(T['text']))
+    app.setPalette(pal)
+
+    _live_windows = scan_mbot_windows()
+    _live_mbots   = []
+    for i, w in enumerate(_live_windows):
+        char, is_dc = _parse_char_name(w.mbot.name)
+        _live_mbots.append(MbotInfo(id=i+1, window_name=w.mbot.name, char=char, is_dc=is_dc))
+
+    w = MainWindow(); w.show()
+
+    if autologin and _accounts:
+        w._append_log(f"--autologin: selecting all {len(_accounts)} accounts and logging in", "ok")
+        w.acc._select_all()
+        QTimer.singleShot(500, w.acc._login_selected)
+
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    accounts = load_accounts()
-    app = MBotManager()
-    app.run()
-    app.mainloop()
+    main()
