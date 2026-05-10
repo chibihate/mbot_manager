@@ -30,6 +30,7 @@ Or use the following batch files to automate on startup:
 | --- | --- |
 | `launch.bat` | Open the tool normally |
 | `launch_autologin.bat` | Open, update first, then auto-login |
+| `sandbox.bat` | Hide and visible the Sandbox Window |
 
 ---
 
@@ -179,6 +180,7 @@ Hoặc dùng các file bat sau để tự động hóa khi khởi động:
 | --- | --- |
 | `launch.bat` | Mở tool bình thường |
 | `launch_autologin.bat` | Mở, update xong rồi mới tự động login |
+| `sandbox.bat` | Ẩn and hiện the Sandbox Window |
 
 ---
 
