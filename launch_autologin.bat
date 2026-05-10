@@ -6,4 +6,4 @@ if not "%1"=="hidden" (
 
 set DIR=%~dp0
 cd /d "%DIR%"
-"%DIR%python\pythonw.exe" "%DIR%mbot_manager.py" --autologin
+"%DIR%python\pythonw.exe" "%DIR%mbot_manager.py" --update --autologin

@@ -1,6 +1,6 @@
 """
 mbot_manager.py — Multi-mBot window manager for Silkroad Online (vSRO 110)
-Requires: Python 3.11+, PyQt6, pywin32, pywinauto  (Windows only)
+Requires: Python 3.11+, PyQt6, pywin32, pywinauto, psutil  (Windows only)
 """
 
 import sys
@@ -242,6 +242,7 @@ def now_ts() -> str:
 # Constants
 # ---------------------------------------------------------------------------
 ACCOUNTS_FILE       = "accounts.json"
+UPDATER_FILE        = "updater.json"
 CHAT_BUTTON_TEXTS   = ["Allchat","PM","Party","Guild","Global","Academy","GM","Union","Unique"]
 INVENTORY_OPTIONS   = ["Avatar","Fellow","Guildstorage","Inventory","Pet","Storage"]
 
@@ -285,6 +286,21 @@ def load_accounts() -> list:
 def save_accounts() -> None:
     with open(ACCOUNTS_FILE, "w") as f:
         json.dump(_accounts, f, indent=4)
+
+
+_updater_paths: list = []
+
+
+def load_updater_paths() -> list:
+    if os.path.exists(UPDATER_FILE):
+        with open(UPDATER_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_updater_paths() -> None:
+    with open(UPDATER_FILE, "w") as f:
+        json.dump(_updater_paths, f, indent=4)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,7 +1041,7 @@ class DashboardPanel(ProcessMbotsMixin, QWidget):
         elif bid == "reset":
             self.process_mbots(sel, [(0, lambda m: m.reset_mbot())])
         elif bid == "getPos":
-            self.process_mbots(sel, [(0, lambda m: m.get_current_position())])
+            self.process_mbots(sel, [(0, lambda m: m.get_current_position()), (100, lambda m: m.save_settings())])
         elif bid == "startTrain":
             self.process_mbots(sel, [(0, lambda m: m.start_training())])
         elif bid == "stopTrain":
@@ -1058,6 +1074,9 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         login_btn = QPushButton("  Login selected  ")
         login_btn.setProperty("primary", True); login_btn.style().unpolish(login_btn); login_btn.style().polish(login_btn)
         login_btn.setFixedHeight(32); login_btn.clicked.connect(self._login_selected)
+        hide_btn = QPushButton("  Hide mBots  ")
+        hide_btn.setFixedHeight(32); hide_btn.clicked.connect(self._hide_selected_mbots)
+        head.addWidget(hide_btn,  0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         head.addWidget(login_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(head)
 
@@ -1227,7 +1246,11 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
             self.log_event.emit(f"Firewall setup failed: {e}", "warn")
 
     def _start_mbot_client(self, index: int) -> None:
-        if index >= len(self.pending_login): return
+        if index >= len(self.pending_login):
+            self.log_event.emit("Login sequence finished — hiding mBot windows", "ok")
+            self._select_all()
+            self._hide_selected_mbots()
+            return
         idx = self.pending_login[index]
         if idx >= len(_accounts): return
         acc      = _accounts[idx]
@@ -1313,7 +1336,9 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
                                               title=f"[{character}] mBot v1.12b (vSRO 110)")
         if mbot_list:
             self.process_mbots([MBotWindow(mbot_list[0])], [
-                (0,   lambda m: m.start_training()),
+                (0,   lambda m: m.get_current_position()),
+                (100, lambda m: m.save_settings()),
+                (100, lambda m: m.start_training()),
                 (100, lambda m: m.show_hide_client()),
                 (100, lambda m: m.show_hide_mbot()),
             ])
@@ -1349,6 +1374,47 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         self._refresh_table()
         self.log_event.emit(f"Added account '{u}' ({char})", "ok")
         self._clear_form()
+
+    def _hide_selected_mbots(self):
+        if not WIN32_AVAILABLE:
+            self.log_event.emit("Win32 not available — cannot hide mBot windows", "warn")
+            return
+        indices = self._selected_indices()
+        if not indices:
+            QMessageBox.information(self, "No selection", "Please select at least one account.")
+            return
+        import psutil
+        hidden = 0
+        for idx in indices:
+            if idx >= len(_accounts):
+                continue
+            mbot_path = _accounts[idx].get("mbot_file_path", "")
+            if not mbot_path:
+                continue
+            file_name = os.path.basename(mbot_path).lower()
+            try:
+                pids = {
+                    p.info["pid"]
+                    for p in psutil.process_iter(["pid", "name"])
+                    if p.info["name"] and p.info["name"].lower() == file_name
+                }
+                def _enum(hwnd, _):
+                    nonlocal hidden
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return
+                    try:
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    except Exception:
+                        return
+                    if pid not in pids:
+                        return
+                    ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                    hidden += 1
+                    self.log_event.emit(f"Hidden window: '{win32gui.GetWindowText(hwnd)}'", "info")
+                win32gui.EnumWindows(_enum, None)
+            except Exception as e:
+                self.log_event.emit(f"Hide error for {file_name}: {e}", "err")
+        self.log_event.emit(f"Hide mBots — {hidden} window(s) hidden", "ok" if hidden else "warn")
 
     def _clear_form(self):
         for w in (self.in_user, self.in_pass, self.in_char, self.in_path):
@@ -1634,6 +1700,441 @@ class LogPanel(QWidget):
         self.log.clear(); self.log_count.setText("0 entries")
 
 # ---------------------------------------------------------------------------
+# Update
+# ---------------------------------------------------------------------------
+
+def _kill_silkroad_processes() -> None:
+    """Terminate all running silkroad.exe / Silkroad.exe processes."""
+    if not WIN32_AVAILABLE:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "silkroad.exe"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "Silkroad.exe"],
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def _count_silkroad_controls() -> int:
+    """Return the child-control count of the first visible silkroad.exe window found."""
+    if not WIN32_AVAILABLE:
+        return 0
+    try:
+        import psutil
+        sro_pids = {
+            p.info["pid"]
+            for p in psutil.process_iter(["pid", "name"])
+            if p.info["name"] and p.info["name"].lower() == "silkroad.exe"
+        }
+        if not sro_pids:
+            return 0
+
+        def _count_children(hwnd) -> int:
+            count = 0
+            child = win32gui.GetWindow(hwnd, win32con.GW_CHILD)
+            while child:
+                count += 1 + _count_children(child)
+                child = win32gui.GetWindow(child, win32con.GW_HWNDNEXT)
+            return count
+
+        best = 0
+
+        def _enum(hwnd, _):
+            nonlocal best
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                return
+            if pid not in sro_pids:
+                return
+            count = _count_children(hwnd)
+            if count > best:
+                best = count
+
+        win32gui.EnumWindows(_enum, None)
+        return best
+    except Exception:
+        return 0
+
+
+def _dismiss_bsobj_dialogs(log_fn=None) -> int:
+    """Find visible 'BSObj Plugin' windows and click OK. Returns count dismissed."""
+    if not WIN32_AVAILABLE:
+        return 0
+    dismissed = 0
+    try:
+        for el in findwindows.find_elements(title="BSObj Plugin"):
+            for child in el.children():
+                if child.name in ("OK", "&OK"):
+                    win32gui.PostMessage(child.handle, win32con.BM_CLICK, 0, 0)
+                    dismissed += 1
+                    if log_fn:
+                        log_fn(f"[Update] Dismissed 'BSObj Plugin' dialog (handle={el.handle})", "warn")
+                    break
+    except Exception as e:
+        if log_fn:
+            log_fn(f"[Update] BSObj check error: {e}", "err")
+    return dismissed
+
+
+def _dismiss_neterror_dialogs(log_fn=None) -> None:
+    """Find visible 'NetError' windows and click OK."""
+    if not WIN32_AVAILABLE:
+        return
+    try:
+        for el in findwindows.find_elements(title="NetError"):
+            for child in el.children():
+                if child.name in ("OK", "&OK"):
+                    win32gui.PostMessage(child.handle, win32con.BM_CLICK, 0, 0)
+                    if log_fn:
+                        log_fn(f"[Update] Dismissed 'NetError' dialog (handle={el.handle})", "warn")
+                    break
+    except Exception as e:
+        if log_fn:
+            log_fn(f"[Update] NetError check error: {e}", "err")
+
+
+class UpdatePanel(QWidget):
+    log_event       = pyqtSignal(str, str)
+    update_finished = pyqtSignal()
+
+    _UPDATE_TIMEOUT_MS  =  60_000   # 1 minute per client
+    _POLL_INTERVAL_MS   =  10_000   # check controls every 10 s
+    _TARGET_CONTROLS    = 25
+    _BSOBJ_CHECK_MS     = 120_000   # BSObj poll: every 2 minutes
+
+    def __init__(self):
+        super().__init__()
+        self._item_changed_connected = False
+        self._update_running  = False
+        self._pending_indices: tuple = ()
+        self._current_index   = 0
+        self._elapsed_ms      = 0
+        self._poll_timer: QTimer | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
+
+        # ── Header ────────────────────────────────────────────────────────
+        head = QHBoxLayout(); head.setSpacing(12)
+        text_col = QVBoxLayout(); text_col.setSpacing(2)
+        text_col.addWidget(QLabel("SRO Updater", objectName="PanelTitle"))
+        self.sub_label = QLabel()
+        self.sub_label.setObjectName("PanelSub")
+        text_col.addWidget(self.sub_label)
+        head.addLayout(text_col, 1)
+        self.update_btn = QPushButton("  Run Update  ")
+        self.update_btn.setProperty("primary", True)
+        self.update_btn.style().unpolish(self.update_btn)
+        self.update_btn.style().polish(self.update_btn)
+        self.update_btn.setFixedHeight(32)
+        self.update_btn.clicked.connect(self._run_update_selected)
+        head.addWidget(self.update_btn, 0,
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(head)
+
+        # ── Toolbar ───────────────────────────────────────────────────────
+        tb = QHBoxLayout(); tb.setSpacing(6)
+        sa = QPushButton("Select all");      sa.clicked.connect(self._select_all)
+        ca = QPushButton("Clear all");       ca.clicked.connect(self._clear_all)
+        rm = QPushButton("Remove selected"); rm.setProperty("danger", True)
+        rm.style().unpolish(rm); rm.style().polish(rm)
+        rm.clicked.connect(self._remove_selected)
+        self.sel_pill = QLabel("0 selected"); self.sel_pill.setObjectName("Pill")
+        tb.addWidget(sa); tb.addWidget(ca); tb.addWidget(rm)
+        tb.addStretch(1); tb.addWidget(self.sel_pill)
+        root.addLayout(tb)
+
+        # ── Table ─────────────────────────────────────────────────────────
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["", "#", "Silkroad.exe path"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setShowGrid(False)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setMinimumHeight(220)
+        root.addWidget(self.table)
+        self._refresh_table()
+
+        # ── Add-path card ─────────────────────────────────────────────────
+        card = QFrame(); card.setObjectName("SignupCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(12, 10, 12, 10); cl.setSpacing(6)
+        cl.addWidget(QLabel("Add Silkroad.exe path",
+                            styleSheet="font-size:12px; font-weight:600;"))
+
+        r1 = QHBoxLayout(); r1.setSpacing(8)
+        self.in_path = QLineEdit(placeholderText=r"C:\Silkroad\Silkroad.exe")
+        browse_btn   = QPushButton("Browse…")
+        browse_btn.setFixedWidth(70)
+        browse_btn.clicked.connect(self._browse)
+        r1.addWidget(self.in_path, 1); r1.addWidget(browse_btn)
+        cl.addLayout(r1)
+
+        r2 = QHBoxLayout(); r2.setSpacing(6)
+        add_btn = QPushButton("Add path"); add_btn.setProperty("primary", True)
+        add_btn.style().unpolish(add_btn); add_btn.style().polish(add_btn)
+        add_btn.clicked.connect(self._add)
+        clr_btn = QPushButton("Clear"); clr_btn.clicked.connect(lambda: self.in_path.clear())
+        r2.addWidget(add_btn); r2.addWidget(clr_btn); r2.addStretch(1)
+        cl.addLayout(r2)
+        root.addWidget(card)
+
+        # ── Status label ──────────────────────────────────────────────────
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet(f"color:{T['text_mute']}; font-size:11px;")
+        root.addWidget(self.status_lbl)
+
+        # ── BSObj auto-check timer (every 2 min) ──────────────────────────
+        self._bsobj_timer = QTimer(self)
+        self._bsobj_timer.timeout.connect(self._auto_bsobj_check)
+        self._bsobj_timer.start(self._BSOBJ_CHECK_MS)
+
+    # ── Table helpers ─────────────────────────────────────────────────────
+    def _refresh_table(self):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(_updater_paths))
+        for i, path in enumerate(_updater_paths):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            chk.setData(Qt.ItemDataRole.UserRole, i)
+            self.table.setItem(i, 0, chk)
+            self.table.setItem(i, 1, QTableWidgetItem(str(i + 1)))
+            path_it = QTableWidgetItem(path)
+            path_it.setForeground(QColor(T['text_dim']))
+            path_it.setToolTip(path)
+            self.table.setItem(i, 2, path_it)
+        self.table.blockSignals(False)
+        self.table.resizeRowsToContents()
+        if not self._item_changed_connected:
+            self.table.itemChanged.connect(
+                lambda it: it.column() == 0 and self._update_pill()
+            )
+            self._item_changed_connected = True
+        self._update_pill()
+        self.sub_label.setText(
+            f"{len(_updater_paths)} path(s) configured. "
+            "Select entries then click Run Update."
+        )
+
+    def _update_pill(self):
+        n = sum(
+            1 for r in range(self.table.rowCount())
+            if (it := self.table.item(r, 0))
+            and it.checkState() == Qt.CheckState.Checked
+        )
+        self.sel_pill.setText(f"{n} selected")
+
+    def _selected_indices(self) -> list[int]:
+        return [
+            self.table.item(r, 0).data(Qt.ItemDataRole.UserRole)
+            for r in range(self.table.rowCount())
+            if (it := self.table.item(r, 0))
+            and it.checkState() == Qt.CheckState.Checked
+        ]
+
+    def _select_all(self):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it: it.setCheckState(Qt.CheckState.Checked)
+        self.table.blockSignals(False); self._update_pill()
+
+    def _clear_all(self):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it: it.setCheckState(Qt.CheckState.Unchecked)
+        self.table.blockSignals(False); self._update_pill()
+
+    def _remove_selected(self):
+        indices = self._selected_indices()
+        if not indices:
+            return
+        if QMessageBox.question(
+            self, "Confirm",
+            f"Remove {len(indices)} path(s)?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for i in sorted(indices, reverse=True):
+            if i < len(_updater_paths):
+                _updater_paths.pop(i)
+        save_updater_paths()
+        self._refresh_table()
+        self.log_event.emit(f"Removed {len(indices)} updater path(s)", "warn")
+
+    # ── CRUD ──────────────────────────────────────────────────────────────
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Silkroad.exe", "",
+            "Applications (*.exe);;All files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if path:
+            self.in_path.setText(os.path.normpath(path))
+
+    def _add(self):
+        path = self.in_path.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Missing path", "Please enter or browse to a Silkroad.exe path.")
+            return
+        if not os.path.exists(path):
+            if QMessageBox.question(
+                self, "Path not found",
+                f"File not found:\n{path}\n\nAdd anyway?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        if path in _updater_paths:
+            QMessageBox.information(self, "Duplicate", "This path is already in the list.")
+            return
+        _updater_paths.append(path)
+        save_updater_paths()
+        self._refresh_table()
+        self.in_path.clear()
+        self.log_event.emit(f"Added updater path: {path}", "ok")
+
+    # ── BSObj auto-check ──────────────────────────────────────────────────
+    def _auto_bsobj_check(self):
+        """Every 2 min: dismiss NetError dialogs, dismiss BSObj dialogs, trigger update if BSObj found."""
+        _dismiss_neterror_dialogs(self.log_event.emit)
+        n = _dismiss_bsobj_dialogs(self.log_event.emit)
+        if n:
+            self.log_event.emit(
+                f"[Update] {n} BSObj Plugin dialog(s) dismissed — starting update sequence", "warn"
+            )
+            self._run_update_all()
+
+    # ── Update sequence ───────────────────────────────────────────────────
+    def _run_update_selected(self):
+        if self._update_running:
+            QMessageBox.information(self, "Busy", "Update already running.")
+            return
+        indices = self._selected_indices()
+        if not indices:
+            QMessageBox.information(self, "No selection",
+                                    "Please select at least one path to update.")
+            return
+        self._start_update(tuple(indices))
+
+    def _run_update_all(self):
+        """Called by the BSObj auto-check to update ALL configured paths."""
+        if self._update_running:
+            return
+        indices = tuple(range(len(_updater_paths)))
+        if not indices:
+            return
+        self._start_update(indices)
+
+    def _start_update(self, indices: tuple):
+        self._update_running  = True
+        self._pending_indices = indices
+        self._current_index   = 0
+        self.update_btn.setEnabled(False)
+        self.log_event.emit(
+            f"[Update] Starting update sequence for {len(indices)} client(s)", "accent"
+        )
+        self._launch_next()
+
+    def _launch_next(self):
+        if self._current_index >= len(self._pending_indices):
+            self._finish_update()
+            return
+
+        idx  = self._pending_indices[self._current_index]
+        if idx >= len(_updater_paths):
+            self._advance()
+            return
+
+        path = _updater_paths[idx]
+        self.log_event.emit(
+            f"[Update] Launching [{self._current_index + 1}/"
+            f"{len(self._pending_indices)}]: {path}", "info"
+        )
+        self._set_status(f"Launching: {os.path.basename(path)} …")
+
+        # Kill any stale silkroad processes first
+        _kill_silkroad_processes()
+
+        try:
+            subprocess.Popen(path, cwd=os.path.dirname(path))
+        except Exception as e:
+            self.log_event.emit(f"[Update] Failed to launch {path}: {e}", "err")
+            self._advance()
+            return
+
+        # Start polling after 10 s
+        self._elapsed_ms = 0
+        QTimer.singleShot(self._POLL_INTERVAL_MS, self._poll_controls)
+
+    def _poll_controls(self):
+        idx  = self._pending_indices[self._current_index]
+        path = _updater_paths[idx] if idx < len(_updater_paths) else "?"
+        self._elapsed_ms += self._POLL_INTERVAL_MS
+
+        count = _count_silkroad_controls()
+
+        if count == 0:
+            # Process may be restarting — ignore this tick and keep waiting
+            self.log_event.emit(
+                f"[Update] {os.path.basename(path)} — controls=0, retrying "
+                f"(elapsed {self._elapsed_ms // 1000}s)", "info"
+            )
+        elif count == self._TARGET_CONTROLS:
+            self.log_event.emit(
+                f"[Update] {os.path.basename(path)} reached {self._TARGET_CONTROLS} controls → done", "ok"
+            )
+            _kill_silkroad_processes()
+            QTimer.singleShot(1000, self._advance)
+            return
+        else:
+            self.log_event.emit(
+                f"[Update] {os.path.basename(path)} — controls={count} "
+                f"(elapsed {self._elapsed_ms // 1000}s)", "info"
+            )
+            self._set_status(
+                f"Updating {os.path.basename(path)} — "
+                f"controls={count}, elapsed={self._elapsed_ms // 1000}s / "
+                f"{self._UPDATE_TIMEOUT_MS // 1000}s"
+            )
+
+        if self._elapsed_ms >= self._UPDATE_TIMEOUT_MS:
+            self.log_event.emit(
+                f"[Update] Timeout for {os.path.basename(path)} — killing and continuing", "warn"
+            )
+            _kill_silkroad_processes()
+            QTimer.singleShot(1000, self._advance)
+            return
+
+        QTimer.singleShot(self._POLL_INTERVAL_MS, self._poll_controls)
+
+    def _advance(self):
+        self._current_index += 1
+        QTimer.singleShot(2000, self._launch_next)
+
+    def _finish_update(self):
+        self._update_running = False
+        self.update_btn.setEnabled(True)
+        self._set_status("Update sequence complete.")
+        self.log_event.emit("[Update] All clients processed.", "ok")
+        self.update_finished.emit()
+
+    def _set_status(self, msg: str):
+        self.status_lbl.setText(msg)
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -1667,11 +2168,13 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
         self.acc   = AccountPanel()
         self.chat  = ChatPanel()
         self.inv   = InventoryPanel()
+        self.upd   = UpdatePanel()
         self.log_panel = LogPanel()
-        for w in (self.dash, self.acc, self.chat, self.inv, self.log_panel):
+        for w in (self.dash, self.acc, self.chat, self.inv, self.upd, self.log_panel):
             self.stack.addWidget(w)
         self.dash.log_event.connect(self._append_log)
         self.acc.log_event.connect(self._append_log)
+        self.upd.log_event.connect(self._append_log)
 
         def _on_scan_done():
             self.chat.list_col.reload()
@@ -1679,7 +2182,7 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
         self.dash._on_scan_done = _on_scan_done
 
         self.nav_buttons: list[QPushButton] = []
-        for i, label in enumerate(["Dashboard","Account","Chat","Inventory","Log"]):
+        for i, label in enumerate(["Dashboard","Account","Chat","Inventory","Update","Log"]):
             b = QPushButton(label); b.setObjectName("NavItem")
             b.setProperty("active", i == 0)
             b.style().unpolish(b); b.style().polish(b)
@@ -1770,7 +2273,7 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main():
-    global _accounts, _live_windows, _live_mbots
+    global _accounts, _live_windows, _live_mbots, _updater_paths
 
     import traceback as _tb
     def _excepthook(exc_type, exc_val, exc_tb):
@@ -1783,9 +2286,11 @@ def main():
     sys.excepthook = _excepthook
 
     autologin = "--autologin" in sys.argv
+    autoupdate = "--update" in sys.argv
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
-    _accounts     = load_accounts()
+    _accounts        = load_accounts()
+    _updater_paths   = load_updater_paths()
     app           = QApplication(sys.argv)
     init_win32_modules()
     app.setStyle("Fusion")
@@ -1807,7 +2312,16 @@ def main():
 
     w = MainWindow(); w.show()
 
-    if autologin and _accounts:
+    if autoupdate and _updater_paths:
+        w._append_log(f"--update: running update for all {len(_updater_paths)} path(s)", "ok")
+        if autologin and _accounts:
+            def _on_update_finished():
+                w._append_log(f"--autologin: selecting all {len(_accounts)} accounts and logging in", "ok")
+                w.acc._select_all()
+                QTimer.singleShot(500, w.acc._login_selected)
+            w.upd.update_finished.connect(_on_update_finished)
+        QTimer.singleShot(500, w.upd._run_update_all)
+    elif autologin and _accounts:
         w._append_log(f"--autologin: selecting all {len(_accounts)} accounts and logging in", "ok")
         w.acc._select_all()
         QTimer.singleShot(500, w.acc._login_selected)

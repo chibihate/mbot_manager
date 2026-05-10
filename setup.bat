@@ -87,7 +87,8 @@ echo [3/4] Installing dependencies (this may take a few minutes)...
     PyQt6>=6.4.0 ^
     pywin32>=306 ^
     pywinauto>=0.6.8 ^
-    uiautomation>=2.0.18
+    uiautomation>=2.0.18 ^
+    psutil>=7.2.2
 
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed.
