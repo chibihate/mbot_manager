@@ -775,8 +775,8 @@ class MbotListColumn(QFrame):
     def reload(self):
         existing = {m.id for m in _live_mbots}
         self.selected = [i for i in self.selected if i in existing]
-        if self.focused not in existing:
-            self.focused = _live_mbots[0].id if _live_mbots else None
+        if self.focused is not None and self.focused not in existing:
+            self.focused = None
         # Clear rows
         while self._bl.count():
             item = self._bl.takeAt(0)
@@ -909,7 +909,7 @@ class DashboardPanel(ProcessMbotsMixin, QWidget):
         # ── Top: mbot list + character cards ─────────────────────────────
         top = QHBoxLayout(); top.setContentsMargins(0,0,0,0); top.setSpacing(0)
 
-        self.list_col = MbotListColumn(multi=True, initial_selected=[1], initial_focus=1)
+        self.list_col = MbotListColumn(multi=True, initial_selected=[], initial_focus=None)
         self.list_col.selection_changed.connect(self._on_sel)
         top.addWidget(self.list_col)
 
