@@ -1275,9 +1275,10 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
 
     def _start_client_sro(self, index: int) -> None:
         if index >= len(self.pending_login):
-            self.log_event.emit("Login sequence finished — hiding mBot windows", "ok")
+            self.log_event.emit("Login sequence finished — hiding mBot windows and training", "ok")
             self._select_all()
             self._hide_selected_mbots()
+            self._start_training()
             return
         acc       = _accounts[self.pending_login[index]]
         username  = acc["username"]
@@ -1392,42 +1393,26 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         for key in ('{Tab}', username, '{Tab}', password, '{Enter}'):
             auto.SendKeys(key, interval=0.08)
         self.log_event.emit(f"Credentials sent for {username}", "ok")
-        QTimer.singleShot(1000, lambda: self._start_training_sro(index))
+        QTimer.singleShot(1000, lambda: self._hide_and_next(index, mbot_hwnd, sro_hwnd))
 
-    def _start_training_sro(self, index: int) -> None:
+    def _hide_and_next(self, index: int, mbot_hwnd: int, sro_hwnd: int) -> None:
         acc       = _accounts[self.pending_login[index]]
         character = acc.get("character", acc["username"])
-
-        mbot_list_dc = findwindows.find_elements(class_name="#32770",
-                                              title=f"[{character} - DC] mBot v1.12b (vSRO 110)")
-        if mbot_list_dc:
-            self.log_event.emit(f"Login complete for {character}", "ok")
-            QTimer.singleShot(1000, lambda: self._start_client_sro(index + 1))
-        windows   = findwindows.find_elements(class_name="CLIENT", title=character)
-        if not windows:
-            QTimer.singleShot(1000, lambda: self._start_training_sro(index)); return
-        win32gui.SetWindowPos(windows[0].handle, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+        win32gui.SetWindowPos(sro_hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
                               win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-        mbot_list = findwindows.find_elements(class_name="#32770",
-                                              title=f"[{character}] mBot v1.12b (vSRO 110)")
-        if mbot_list:
-            MBotWindow(mbot_list[0]).start_training()
-        QTimer.singleShot(2000, lambda: self._hide_and_next(index))
+        ctypes.windll.user32.ShowWindow(mbot_hwnd, 0)
+        ctypes.windll.user32.ShowWindow(sro_hwnd, 0)
 
-    def _hide_and_next(self, index: int) -> None:
-        acc       = _accounts[self.pending_login[index]]
-        character = acc.get("character", acc["username"])
-        mbot_list = findwindows.find_elements(class_name="#32770",
-                                              title=f"[{character}] mBot v1.12b (vSRO 110)")
+        self.log_event.emit(f"Login complete for {character}", "ok")
+        QTimer.singleShot(1000, lambda: self._start_client_sro(index + 1))
+
+    def _start_training(self) -> None:
+        mbot_list = findwindows.find_elements(class_name="#32770")
         if mbot_list:
             self.process_mbots([MBotWindow(mbot_list[0])], [
                 (0,   lambda m: m.start_training()),
                 (100, lambda m: m.start_training()),
-                (100, lambda m: m.show_hide_client()),
-                (100, lambda m: m.show_hide_mbot()),
             ])
-        self.log_event.emit(f"Login complete for {character}", "ok")
-        QTimer.singleShot(1000, lambda: self._start_client_sro(index + 1))
 
     # ── CRUD ──────────────────────────────────────────────────────────────
     def _browse_mbot(self):
