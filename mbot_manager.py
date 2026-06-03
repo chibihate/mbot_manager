@@ -2493,6 +2493,7 @@ def main():
         w._append_log(f"--update: running update for all {len(_updater_paths)} path(s)", "ok")
         if autologin and _accounts:
             def _on_update_finished():
+                w.upd.update_finished.disconnect(_on_update_finished)
                 w._append_log(f"--autologin: selecting all {len(_accounts)} accounts and logging in", "ok")
                 w.acc._select_all()
                 QTimer.singleShot(500, w.acc._login_selected)
