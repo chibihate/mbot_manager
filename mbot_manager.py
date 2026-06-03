@@ -245,6 +245,7 @@ ACCOUNTS_FILE       = "accounts.json"
 UPDATER_FILE        = "updater.json"
 CHAT_BUTTON_TEXTS   = ["Allchat","PM","Party","Guild","Global","Academy","GM","Union","Unique"]
 INVENTORY_OPTIONS   = ["Avatar","Fellow","Guildstorage","Inventory","Pet","Storage"]
+_MBOT_RUNNING_RE = r"^\[[^-]+?\]\s+mBot v1\.12b \(vSRO 110\)$"
 
 # ---------------------------------------------------------------------------
 # TCVN3 → Unicode lookup
@@ -1055,7 +1056,8 @@ class DashboardPanel(ProcessMbotsMixin, QWidget):
 # ---------------------------------------------------------------------------
 
 class AccountPanel(ProcessMbotsMixin, QWidget):
-    log_event = pyqtSignal(str, str)
+    log_event    = pyqtSignal(str, str)
+    training_done = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -1278,7 +1280,7 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
             self.log_event.emit("Login sequence finished — hiding mBot windows and training", "ok")
             self._select_all()
             self._hide_selected_mbots()
-            self._start_training()
+            QTimer.singleShot(60000, lambda: self._start_training())
             return
         acc       = _accounts[self.pending_login[index]]
         username  = acc["username"]
@@ -1407,12 +1409,18 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         QTimer.singleShot(1000, lambda: self._start_client_sro(index + 1))
 
     def _start_training(self) -> None:
-        mbot_list = findwindows.find_elements(class_name="#32770")
-        if mbot_list:
-            self.process_mbots([MBotWindow(mbot_list[0])], [
-                (0,   lambda m: m.start_training()),
-                (100, lambda m: m.start_training()),
-            ])
+        all_mbots = findwindows.find_elements(class_name="#32770", visible_only=False, title_re=_MBOT_RUNNING_RE)
+        total_delay = 0
+        for elem in all_mbots:
+            actions = [
+                (1000, lambda m: m.start_training()),
+                (1000, lambda m: m.start_training()),
+                (1000, lambda m: m.kill_client()),
+            ]
+            self.process_mbots([MBotWindow(elem)], actions)
+            total_delay = max(total_delay, sum(d for d, _ in actions) + 100)
+        notify_delay = total_delay + 500 if all_mbots else 0
+        QTimer.singleShot(notify_delay, self.training_done.emit)
 
     # ── CRUD ──────────────────────────────────────────────────────────────
     def _browse_mbot(self):
@@ -1835,7 +1843,6 @@ def _count_silkroad_controls() -> int:
     except Exception:
         return 0
 
-
 def _dismiss_bsobj_dialogs(log_fn=None) -> int:
     """Find visible 'BSObj Plugin' windows and click OK. Returns count dismissed."""
     if not WIN32_AVAILABLE:
@@ -1848,11 +1855,11 @@ def _dismiss_bsobj_dialogs(log_fn=None) -> int:
                     win32gui.PostMessage(child.handle, win32con.BM_CLICK, 0, 0)
                     dismissed += 1
                     if log_fn:
-                        log_fn(f"[Update] Dismissed 'BSObj Plugin' dialog (handle={el.handle})", "warn")
+                        log_fn(f"[AutoCheck] Dismissed 'BSObj Plugin' dialog (handle={el.handle})", "warn")
                     break
     except Exception as e:
         if log_fn:
-            log_fn(f"[Update] BSObj check error: {e}", "err")
+            log_fn(f"[AutoCheck] BSObj check error: {e}", "err")
     return dismissed
 
 
@@ -1866,11 +1873,11 @@ def _dismiss_neterror_dialogs(log_fn=None) -> None:
                 if child.name in ("OK", "&OK"):
                     win32gui.PostMessage(child.handle, win32con.BM_CLICK, 0, 0)
                     if log_fn:
-                        log_fn(f"[Update] Dismissed 'NetError' dialog (handle={el.handle})", "warn")
+                        log_fn(f"[AutoCheck] Dismissed 'NetError' dialog (handle={el.handle})", "warn")
                     break
     except Exception as e:
         if log_fn:
-            log_fn(f"[Update] NetError check error: {e}", "err")
+            log_fn(f"[AutoCheck] NetError check error: {e}", "err")
 
 def _dismiss_openerror_dialogs(log_fn=None) -> None:
     """Find visible 'Error' windows and click OK."""
@@ -1882,11 +1889,11 @@ def _dismiss_openerror_dialogs(log_fn=None) -> None:
                 if child.name in ("OK", "&OK"):
                     win32gui.PostMessage(child.handle, win32con.BM_CLICK, 0, 0)
                     if log_fn:
-                        log_fn(f"[Update] Dismissed 'Error' dialog (handle={el.handle})", "warn")
+                        log_fn(f"[AutoCheck] Dismissed 'Error' dialog (handle={el.handle})", "warn")
                     break
     except Exception as e:
         if log_fn:
-            log_fn(f"[Update] Error check error: {e}", "err")
+            log_fn(f"[AutoCheck] Error check error: {e}", "err")
 
 
 class UpdatePanel(QWidget):
@@ -1896,7 +1903,7 @@ class UpdatePanel(QWidget):
     _UPDATE_TIMEOUT_MS  =  60_000   # 1 minute per client
     _POLL_INTERVAL_MS   =  5_000   # check controls every 5 s
     _TARGET_CONTROLS    = 25
-    _BSOBJ_CHECK_MS     = 60_000   # BSObj poll: every 1 minutes
+    _RUNNING_CHECK_MS     = 60_000   # Running poll: every 1 minutes
 
     def __init__(self):
         super().__init__()
@@ -1984,10 +1991,10 @@ class UpdatePanel(QWidget):
         self.status_lbl.setStyleSheet(f"color:{T['text_mute']}; font-size:11px;")
         root.addWidget(self.status_lbl)
 
-        # ── BSObj auto-check timer (every 2 min) ──────────────────────────
-        self._bsobj_timer = QTimer(self)
-        self._bsobj_timer.timeout.connect(self._auto_bsobj_check)
-        self._bsobj_timer.start(self._BSOBJ_CHECK_MS)
+        # ── Running auto-check timer (every 1 min) ──────────────────────────
+        self._running_timer = QTimer(self)
+        self._running_timer.timeout.connect(self._auto_running_check)
+        self._running_timer.start(self._RUNNING_CHECK_MS)
 
     # ── Table helpers ─────────────────────────────────────────────────────
     def _refresh_table(self):
@@ -2093,9 +2100,9 @@ class UpdatePanel(QWidget):
         self.in_path.clear()
         self.log_event.emit(f"Added updater path: {path}", "ok")
 
-    # ── BSObj auto-check ──────────────────────────────────────────────────
-    def _auto_bsobj_check(self):
-        """Every 1 min: dismiss NetError dialogs, dismiss BSObj dialogs, trigger update if BSObj found."""
+    # ── Running auto-check ──────────────────────────────────────────────────
+    def _auto_running_check(self):
+        """Every 1 min: dismiss NetError dialogs, dismiss OpenError dialogs, dismiss BSObj dialogs, trigger update if BSObj found."""
         _dismiss_neterror_dialogs(self.log_event.emit)
         _dismiss_openerror_dialogs(self.log_event.emit)
         n = _dismiss_bsobj_dialogs(self.log_event.emit)
@@ -2224,6 +2231,46 @@ class UpdatePanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Utils panel
+# ---------------------------------------------------------------------------
+
+class UtilsPanel(QWidget):
+    toggle_changed = pyqtSignal(str, bool)  # (flag_name, enabled)
+
+    def __init__(self):
+        super().__init__()
+        root = QVBoxLayout(self); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+
+        hdr = QFrame()
+        hdr.setStyleSheet(f"background:{T['bg_panel']}; border-bottom:1px solid {T['border']};")
+        lh = QHBoxLayout(hdr); lh.setContentsMargins(12, 6, 12, 6)
+        lh.addWidget(QLabel("UTILS", styleSheet=f"color:{T['text_dim']};font-weight:600;font-size:10px;letter-spacing:0.5px;"))
+        lh.addStretch(1)
+        root.addWidget(hdr)
+
+        body = QWidget()
+        bl = QVBoxLayout(body); bl.setContentsMargins(16, 16, 16, 16); bl.setSpacing(12)
+
+        self._kill_sro_chk = QCheckBox("Auto-kill SRO client when mBot title changes")
+        self._kill_sro_chk.setToolTip(
+            "When enabled: each time mBot windows are re-scanned and a running mBot\n"
+            "is detected (title matches '[CharName] mBot v1.12b'), its child SRO\n"
+            "process is killed automatically."
+        )
+        self._kill_sro_chk.stateChanged.connect(
+            lambda _: self.toggle_changed.emit("kill_sro_client", self._kill_sro_chk.isChecked())
+        )
+        bl.addWidget(self._kill_sro_chk)
+        bl.addStretch(1)
+
+        root.addWidget(body, 1)
+
+    @property
+    def kill_sro_client_enabled(self) -> bool:
+        return self._kill_sro_chk.isChecked()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -2258,12 +2305,15 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
         self.chat  = ChatPanel()
         self.inv   = InventoryPanel()
         self.upd   = UpdatePanel()
+        self.utils = UtilsPanel()
         self.log_panel = LogPanel()
-        for w in (self.dash, self.acc, self.chat, self.inv, self.upd, self.log_panel):
+        for w in (self.dash, self.acc, self.chat, self.inv, self.upd, self.utils, self.log_panel):
             self.stack.addWidget(w)
         self.dash.log_event.connect(self._append_log)
         self.acc.log_event.connect(self._append_log)
         self.upd.log_event.connect(self._append_log)
+        self.utils.toggle_changed.connect(self._on_utils_toggle)
+        self.acc.training_done.connect(self._on_training_done)
 
         def _on_scan_done():
             self.chat.list_col.reload()
@@ -2271,7 +2321,7 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
         self.dash._on_scan_done = _on_scan_done
 
         self.nav_buttons: list[QPushButton] = []
-        for i, label in enumerate(["Dashboard","Account","Chat","Inventory","Update","Log"]):
+        for i, label in enumerate(["Dashboard","Account","Chat","Inventory","Update","Utils","Log"]):
             b = QPushButton(label); b.setObjectName("NavItem")
             b.setProperty("active", i == 0)
             b.style().unpolish(b); b.style().polish(b)
@@ -2311,6 +2361,42 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
             f"<span style='color:{T['success']}'>●</span> {online} mBots online</span>"
         )
 
+    def _on_utils_toggle(self, flag: str, enabled: bool):
+        label = "ON" if enabled else "OFF"
+        self._append_log(f"[Utils] {flag} → {label}", "info")
+
+    def _on_training_done(self):
+        self.utils._kill_sro_chk.setChecked(True)
+        self._append_log("[Utils] Training started — auto-kill SRO client enabled", "ok")
+
+    def _kill_sro_client_running(self):
+        """Find mBot running (class #32770) and kill their child sro client processes."""
+        if not WIN32_AVAILABLE:
+            return
+        try:
+            import psutil
+            for el in findwindows.find_elements(class_name="#32770", visible_only=False, title_re=_MBOT_RUNNING_RE):
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(el.handle)
+                    children = psutil.Process(pid).children(recursive=False)
+                    if not children:
+                        continue
+                    for child in children:
+                        def _do_kill(c=child, name=el.name):
+                            try:
+                                c.kill()
+                                self._append_log(
+                                    f"Killed child pid={c.pid} ({c.name()}) of mBot '{name}'",
+                                    "warn",
+                                )
+                            except Exception as e:
+                                self._append_log(f"Failed to kill child pid={c.pid}: {e}", "err")
+                        QTimer.singleShot(120_000, _do_kill)
+                except Exception as e:
+                    self._append_log(f"Failed to process mBot '{el.name}': {e}", "err")
+        except Exception as e:
+            self._append_log(f"_kill_sro_client_running error: {e}", "err")
+                
     def _scan_if_changed(self):
         if not WIN32_AVAILABLE: return
         global _live_windows, _live_mbots
@@ -2329,6 +2415,8 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
         self.dash._rebuild_ui()
         self.chat.list_col.reload()
         self.inv.list_col.reload()
+        if self.utils.kill_sro_client_enabled:
+            self._kill_sro_client_running()
 
     def _poll_hp_mp(self):
         if not _live_windows: return
