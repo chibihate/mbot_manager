@@ -1,0 +1,14 @@
+<Configuration>
+<MappedFolders>
+  <MappedFolder>
+    <HostFolder>D:\Sandbox\Game\SRO</HostFolder>
+    <SandboxFolder>C:\Users\WDAGUtilityAccount\Documents</SandboxFolder>
+  </MappedFolder>
+</MappedFolders>
+<MemoryInMB>16384</MemoryInMB>
+<AudioInput>Enable</AudioInput>
+<VideoInput>Enable</VideoInput>
+<LogonCommand>
+  <Command>powershell.exe -ExecutionPolicy Bypass -File C:\Users\WDAGUtilityAccount\Documents\SandboxScript.ps1</Command>
+</LogonCommand>
+</Configuration>

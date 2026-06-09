@@ -775,8 +775,8 @@ class MbotListColumn(QFrame):
     def reload(self):
         existing = {m.id for m in _live_mbots}
         self.selected = [i for i in self.selected if i in existing]
-        if self.focused not in existing:
-            self.focused = _live_mbots[0].id if _live_mbots else None
+        if self.focused is not None and self.focused not in existing:
+            self.focused = None
         # Clear rows
         while self._bl.count():
             item = self._bl.takeAt(0)
@@ -909,7 +909,7 @@ class DashboardPanel(ProcessMbotsMixin, QWidget):
         # ── Top: mbot list + character cards ─────────────────────────────
         top = QHBoxLayout(); top.setContentsMargins(0,0,0,0); top.setSpacing(0)
 
-        self.list_col = MbotListColumn(multi=True, initial_selected=[1], initial_focus=1)
+        self.list_col = MbotListColumn(multi=True, initial_selected=[], initial_focus=None)
         self.list_col.selection_changed.connect(self._on_sel)
         top.addWidget(self.list_col)
 
@@ -1224,7 +1224,7 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         self.log_event.emit(f"Starting login sequence → {names}", "ok")
         if WIN32_AVAILABLE:
             self.pending_login = tuple(indices)
-            self._start_mbot_client(0)
+            self._launch_all_mbots(0)
         else:
             self.log_event.emit("Win32 not available — login sequence skipped (not on Windows)", "warn")
 
@@ -1245,105 +1245,174 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         except Exception as e:
             self.log_event.emit(f"Firewall setup failed: {e}", "warn")
 
-    def _start_mbot_client(self, index: int) -> None:
+    def _launch_all_mbots(self, index: int) -> None:
         if index >= len(self.pending_login):
-            self.log_event.emit("Login sequence finished — hiding mBot windows", "ok")
-            self._select_all()
-            self._hide_selected_mbots()
+            self.log_event.emit("All mBots launched — starting login sequence", "ok")
+            QTimer.singleShot(1000, lambda: self._start_client_sro(0))
             return
         idx = self.pending_login[index]
-        if idx >= len(_accounts): return
+        if idx >= len(_accounts):
+            QTimer.singleShot(200, lambda i=index: self._launch_all_mbots(i + 1)); return
         acc      = _accounts[idx]
         username = acc["username"]
         for title in [f"[{username}] mBot v1.12b (vSRO 110)",
                       f"[{username} - DC] mBot v1.12b (vSRO 110)"]:
             if findwindows.find_elements(class_name="#32770", title=title, visible_only=False):
-                self.log_event.emit(f"mBot already open for {username}, skipping", "info")
-                QTimer.singleShot(1000, lambda: self._start_mbot_client(index + 1)); return
+                self.log_event.emit(f"mBot already open for {username}", "info")
+                QTimer.singleShot(200, lambda i=index: self._launch_all_mbots(i + 1))
+                return
         mbot_path = acc.get("mbot_file_path", "")
         if not mbot_path or not os.path.exists(mbot_path):
             self.log_event.emit(f"mBot path not found for {username}: {mbot_path}", "err")
-            QTimer.singleShot(500, lambda: self._start_mbot_client(index + 1)); return
+            QTimer.singleShot(200, lambda i=index: self._launch_all_mbots(i + 1)); return
         folder   = os.path.normpath(os.path.dirname(mbot_path))
         vsro_exe = os.path.join(folder, "mBot_vSRO110.exe")
         if os.path.exists(vsro_exe):
             self._ensure_firewall(vsro_exe, username)
         subprocess.Popen(mbot_path, cwd=folder)
         self.log_event.emit(f"Launched mBot for {username}", "info")
-        QTimer.singleShot(3000, lambda: self._start_client_sro(index))
+        QTimer.singleShot(1000, lambda i=index: self._launch_all_mbots(i + 1))
 
     def _start_client_sro(self, index: int) -> None:
-        username  = _accounts[self.pending_login[index]]["username"]
-        mbot_list = findwindows.find_elements(class_name="#32770", title="mBot v1.12b (vSRO 110)")
-        if not mbot_list:
-            QTimer.singleShot(1000, lambda: self._start_client_sro(index)); return
-        MBotWindow(mbot_list[0]).start_client()
-        self.log_event.emit(f"Start Client sent for {username}", "info")
-        QTimer.singleShot(10_000, lambda: self._login_sro(index))
+        if index >= len(self.pending_login):
+            self.log_event.emit("Login sequence finished — hiding mBot windows and training", "ok")
+            self._select_all()
+            self._hide_selected_mbots()
+            QTimer.singleShot(60000, lambda: self._start_training())
+            return
+        acc       = _accounts[self.pending_login[index]]
+        username  = acc["username"]
+        character = acc.get("character", username)
+        all_mbots = findwindows.find_elements(class_name="#32770",
+                        title="mBot v1.12b (vSRO 110)", visible_only=False) or []
+        self.log_event.emit(
+            f"[{username}] scanning {len(all_mbots)} mBot window(s) for character='{character}'", "info")
+        for elem in all_mbots:
+            ctrl = MBotWindow(elem)._find_nth("Character to login", 1)
+            ctrl_name = ctrl.name.strip() if ctrl else "<not found>"
+            self.log_event.emit(f"  hwnd={elem.handle} → 'Character to login'='{ctrl_name}'", "info")
+            if ctrl and ctrl_name == character:
+                mbot_hwnd = elem.handle
+                MBotWindow(elem).start_client()
+                self.log_event.emit(f"Start Client sent for {username}", "info")
+                QTimer.singleShot(1000, lambda: self._wait_sro_client(index, mbot_hwnd))
+                return
+        self.log_event.emit(f"[{username}] no matching mBot found, retrying...", "warn")
+        QTimer.singleShot(1000, lambda: self._start_client_sro(index))
 
-    def _login_sro(self, index: int) -> None:
-        windows = findwindows.find_elements(class_name="CLIENT", title="SRO_Client")
-        if not windows:
-            QTimer.singleShot(2000, lambda: self._login_sro(index)); return
-        handle = windows[0].handle
-        ctypes.windll.user32.ShowWindow(handle, 5)
-        win32gui.SetWindowPos(handle, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-        left, top, right, bottom = win32gui.GetWindowRect(handle)
-        cx = left + (right - left) // 2
-        cy = top  + (bottom - top) // 2
-        QTimer.singleShot(2000, lambda: self._login_click_center(index, cx, cy))
+    def _wait_sro_client(self, index: int, mbot_hwnd: int, sro_seen: bool = False) -> None:
+        import psutil
+        username = _accounts[self.pending_login[index]]["username"]
+        try:
+            _, mbot_pid = win32process.GetWindowThreadProcessId(mbot_hwnd)
+            child_pids  = {c.pid for c in psutil.Process(mbot_pid).children(recursive=True)}
+        except Exception:
+            QTimer.singleShot(1000, lambda: self._wait_sro_client(index, mbot_hwnd, sro_seen)); return
 
-    def _login_click_center(self, index, cx, cy):
+        if not child_pids and sro_seen:
+            self.log_event.emit(f"SRO_Client process lost for {username}, restarting", "warn")
+            try:
+                elems = findwindows.find_elements(handle=mbot_hwnd)
+                if elems:
+                    MBotWindow(elems[0]).start_client()
+            except Exception:
+                pass
+            QTimer.singleShot(1000, lambda: self._wait_sro_client(index, mbot_hwnd, False)); return
+
+        found = None
+
+        def _enum(hwnd, _):
+            nonlocal found
+            if found:
+                return
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid not in child_pids:
+                    return
+                if win32gui.GetClassName(hwnd) != "CLIENT":
+                    return
+                if win32gui.GetWindowText(hwnd) != "SRO_Client":
+                    return
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                if (r - l) >= 800 and (b - t) >= 600:
+                    found = hwnd
+            except Exception:
+                pass
+
+        win32gui.EnumWindows(_enum, None)
+
+        if found:
+            self.log_event.emit(f"SRO_Client available for {username}, waiting 2s", "info")
+            ctypes.windll.user32.ShowWindow(found, 5)
+            win32gui.SetWindowPos(found, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            l, t, r, b = win32gui.GetWindowRect(found)
+            cx = l + (r - l) // 2
+            cy = t + (b - t) // 2
+            QTimer.singleShot(3000, lambda: self._login_click_center(index, mbot_hwnd, found, cx, cy))
+        else:
+            QTimer.singleShot(1000, lambda: self._wait_sro_client(index, mbot_hwnd, bool(child_pids)))
+
+    def _restart_client(self, index: int, mbot_hwnd: int) -> None:
+        username = _accounts[self.pending_login[index]]["username"]
+        self.log_event.emit(f"SRO_Client lost during login for {username}, restarting", "warn")
+        try:
+            elems = findwindows.find_elements(handle=mbot_hwnd)
+            if elems:
+                MBotWindow(elems[0]).start_client()
+        except Exception:
+            pass
+        QTimer.singleShot(1000, lambda: self._wait_sro_client(index, mbot_hwnd, False))
+
+    def _login_click_center(self, index, mbot_hwnd, sro_hwnd, cx, cy):
+        if not win32gui.IsWindow(sro_hwnd):
+            self._restart_client(index, mbot_hwnd); return
         auto.Click(cx, cy)
-        QTimer.singleShot(2000, lambda: self._login_click_server(index, cx, cy))
+        QTimer.singleShot(600, lambda: self._login_click_server(index, mbot_hwnd, sro_hwnd, cx, cy))
 
-    def _login_click_server(self, index, cx, cy):
+    def _login_click_server(self, index, mbot_hwnd, sro_hwnd, cx, cy):
+        if not win32gui.IsWindow(sro_hwnd):
+            self._restart_client(index, mbot_hwnd); return
         auto.Click(cx, cy - 125)
-        QTimer.singleShot(2000, lambda: self._login_choose_server(index, cx, cy))
+        QTimer.singleShot(600, lambda: self._login_choose_server(index, mbot_hwnd, sro_hwnd, cx, cy))
 
-    def _login_choose_server(self, index, cx, cy):
+    def _login_choose_server(self, index, mbot_hwnd, sro_hwnd, cx, cy):
+        if not win32gui.IsWindow(sro_hwnd):
+            self._restart_client(index, mbot_hwnd); return
         auto.Click(cx - 50, cy + 200)
-        QTimer.singleShot(1500, lambda: self._login_enter_credentials(index))
+        QTimer.singleShot(600, lambda: self._login_enter_credentials(index, mbot_hwnd, sro_hwnd))
 
-    def _login_enter_credentials(self, index: int) -> None:
+    def _login_enter_credentials(self, index: int, mbot_hwnd: int, sro_hwnd: int) -> None:
+        if not win32gui.IsWindow(sro_hwnd):
+            self._restart_client(index, mbot_hwnd); return
         acc      = _accounts[self.pending_login[index]]
         username = acc["username"]
         password = base64.b64decode(acc["password"]).decode("utf-8")
         for key in ('{Tab}', username, '{Tab}', password, '{Enter}'):
             auto.SendKeys(key, interval=0.08)
         self.log_event.emit(f"Credentials sent for {username}", "ok")
-        QTimer.singleShot(15_000, lambda: self._start_training_sro(index))
+        QTimer.singleShot(1000, lambda: self._hide_and_next(index, mbot_hwnd, sro_hwnd))
 
-    def _start_training_sro(self, index: int) -> None:
+    def _hide_and_next(self, index: int, mbot_hwnd: int, sro_hwnd: int) -> None:
         acc       = _accounts[self.pending_login[index]]
         character = acc.get("character", acc["username"])
-        windows   = findwindows.find_elements(class_name="CLIENT", title=character)
-        if not windows:
-            QTimer.singleShot(5000, lambda: self._start_training_sro(index)); return
-        win32gui.SetWindowPos(windows[0].handle, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+        win32gui.SetWindowPos(sro_hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
                               win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-        mbot_list = findwindows.find_elements(class_name="#32770",
-                                              title=f"[{character}] mBot v1.12b (vSRO 110)")
-        if mbot_list:
-            MBotWindow(mbot_list[0]).start_training()
-        QTimer.singleShot(5000, lambda: self._hide_and_next(index))
+        ctypes.windll.user32.ShowWindow(mbot_hwnd, 0)
+        ctypes.windll.user32.ShowWindow(sro_hwnd, 0)
 
-    def _hide_and_next(self, index: int) -> None:
-        acc       = _accounts[self.pending_login[index]]
-        character = acc.get("character", acc["username"])
-        mbot_list = findwindows.find_elements(class_name="#32770",
-                                              title=f"[{character}] mBot v1.12b (vSRO 110)")
+        self.log_event.emit(f"Login complete for {character}", "ok")
+        QTimer.singleShot(2000, lambda: self._start_client_sro(index + 1))
+
+    def _start_training(self) -> None:
+        mbot_list = findwindows.find_elements(class_name="#32770")
         if mbot_list:
             self.process_mbots([MBotWindow(mbot_list[0])], [
-                (0,   lambda m: m.get_current_position()),
-                (100, lambda m: m.save_settings()),
+                (0,   lambda m: m.start_training()),
                 (100, lambda m: m.start_training()),
-                (100, lambda m: m.show_hide_client()),
-                (100, lambda m: m.show_hide_mbot()),
             ])
-        self.log_event.emit(f"Login complete for {character}", "ok")
-        QTimer.singleShot(2000, lambda: self._start_mbot_client(index + 1))
 
     # ── CRUD ──────────────────────────────────────────────────────────────
     def _browse_mbot(self):
@@ -1618,6 +1687,9 @@ class InventoryPanel(QWidget):
                 if m:
                     totals[m.group(1)] += int(m.group(2))
                     slots[m.group(1)]  += 1
+                elif inv_idx == 4:
+                    totals[line]  = 1
+                    slots[line] = 1
             if totals:
                 for item in sorted(totals):
                     inv_html.append(
@@ -1800,15 +1872,31 @@ def _dismiss_neterror_dialogs(log_fn=None) -> None:
         if log_fn:
             log_fn(f"[Update] NetError check error: {e}", "err")
 
+def _dismiss_openerror_dialogs(log_fn=None) -> None:
+    """Find visible 'Error' windows and click OK."""
+    if not WIN32_AVAILABLE:
+        return
+    try:
+        for el in findwindows.find_elements(class_name="#32770", title="Error"):
+            for child in el.children():
+                if child.name in ("OK", "&OK"):
+                    win32gui.PostMessage(child.handle, win32con.BM_CLICK, 0, 0)
+                    if log_fn:
+                        log_fn(f"[Update] Dismissed 'Error' dialog (handle={el.handle})", "warn")
+                    break
+    except Exception as e:
+        if log_fn:
+            log_fn(f"[Update] Error check error: {e}", "err")
+
 
 class UpdatePanel(QWidget):
     log_event       = pyqtSignal(str, str)
     update_finished = pyqtSignal()
 
     _UPDATE_TIMEOUT_MS  =  60_000   # 1 minute per client
-    _POLL_INTERVAL_MS   =  10_000   # check controls every 10 s
+    _POLL_INTERVAL_MS   =  5_000   # check controls every 5 s
     _TARGET_CONTROLS    = 25
-    _BSOBJ_CHECK_MS     = 120_000   # BSObj poll: every 2 minutes
+    _BSOBJ_CHECK_MS     = 60_000   # BSObj poll: every 1 minutes
 
     def __init__(self):
         super().__init__()
@@ -2007,8 +2095,9 @@ class UpdatePanel(QWidget):
 
     # ── BSObj auto-check ──────────────────────────────────────────────────
     def _auto_bsobj_check(self):
-        """Every 2 min: dismiss NetError dialogs, dismiss BSObj dialogs, trigger update if BSObj found."""
+        """Every 1 min: dismiss NetError dialogs, dismiss BSObj dialogs, trigger update if BSObj found."""
         _dismiss_neterror_dialogs(self.log_event.emit)
+        _dismiss_openerror_dialogs(self.log_event.emit)
         n = _dismiss_bsobj_dialogs(self.log_event.emit)
         if n:
             self.log_event.emit(
@@ -2205,15 +2294,15 @@ class MainWindow(ProcessMbotsMixin, QMainWindow):
         if not WIN32_AVAILABLE:
             self._append_log("win32/pywinauto not available — running in UI-only mode", "warn")
 
-        # HP/MP/KPH poll every 1 s
+        # HP/MP/KPH poll every 0.5 s
         self._hp_mp_timer = QTimer(self)
         self._hp_mp_timer.timeout.connect(self._poll_hp_mp)
-        self._hp_mp_timer.start(1000)
+        self._hp_mp_timer.start(500)
 
-        # Window change detection every 60 s
+        # Window change detection every 5 s
         self._scan_timer = QTimer(self)
         self._scan_timer.timeout.connect(self._scan_if_changed)
-        self._scan_timer.start(60_000)
+        self._scan_timer.start(5_000)
 
     def _update_title(self, online: int):
         self.title_text.setText(
