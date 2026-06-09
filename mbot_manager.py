@@ -1278,7 +1278,7 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
             self.log_event.emit("Login sequence finished — hiding mBot windows and training", "ok")
             self._select_all()
             self._hide_selected_mbots()
-            self._start_training()
+            QTimer.singleShot(60000, lambda: self._start_training())
             return
         acc       = _accounts[self.pending_login[index]]
         username  = acc["username"]
@@ -1351,7 +1351,7 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
             l, t, r, b = win32gui.GetWindowRect(found)
             cx = l + (r - l) // 2
             cy = t + (b - t) // 2
-            QTimer.singleShot(2000, lambda: self._login_click_center(index, mbot_hwnd, found, cx, cy))
+            QTimer.singleShot(3000, lambda: self._login_click_center(index, mbot_hwnd, found, cx, cy))
         else:
             QTimer.singleShot(1000, lambda: self._wait_sro_client(index, mbot_hwnd, bool(child_pids)))
 
@@ -1404,7 +1404,7 @@ class AccountPanel(ProcessMbotsMixin, QWidget):
         ctypes.windll.user32.ShowWindow(sro_hwnd, 0)
 
         self.log_event.emit(f"Login complete for {character}", "ok")
-        QTimer.singleShot(1000, lambda: self._start_client_sro(index + 1))
+        QTimer.singleShot(2000, lambda: self._start_client_sro(index + 1))
 
     def _start_training(self) -> None:
         mbot_list = findwindows.find_elements(class_name="#32770")
