@@ -148,6 +148,177 @@ python mbot_manager.py [--autologin] [--update]
 ---
 
 ---
+
+# Architecture v2 — Core + GUI split
+
+> This section documents the new architecture added alongside the original `mbot_manager.py` (which remains untouched as reference).
+
+## Overview
+
+The original monolithic file mixes Win32 window automation, Qt timers, and UI code together. The v2 architecture separates them into three layers:
+
+```
+┌─────────────────────────────────────┐
+│          GUI layer (choose one)     │
+│   gui_qt/main.py  │  gui_web/       │
+│   (PyQt6, local)  │  (FastAPI+HTML) │
+└────────────┬──────┴────────┬────────┘
+             │  SQLite3 DB   │
+             │  (read state, │
+             │  write cmds)  │
+┌────────────▼───────────────▼────────┐
+│         core/worker.py              │
+│  (background process, Win32 only)   │
+└─────────────────────────────────────┘
+```
+
+- **core/** — all Win32 interaction, no Qt dependency, runs as a standalone subprocess
+- **SQLite3** (`mbot_state.db`) — shared state bus between worker and GUI
+- **gui_qt/** — PyQt6 GUI that reads state from DB, sends commands via DB
+- **gui_web/** — FastAPI + Tailwind web UI, accessible over Tailscale from mobile
+
+---
+
+## Project structure
+
+```
+mbot_manager/
+├── mbot_manager.py        ← original (reference, do not modify)
+├── core/
+│   ├── window.py          ← MBotWindow, win32 helpers, scan_mbot_windows
+│   ├── db.py              ← SQLite3 schema + read/write helpers
+│   ├── worker.py          ← background process (5 threads)
+│   └── login.py           ← login sequence (QTimer → threading)
+├── gui_qt/
+│   └── main.py            ← PyQt6 GUI, reads from DB, enqueues commands
+├── gui_web/
+│   ├── server.py          ← FastAPI + WebSocket
+│   └── static/
+│       ├── index.html
+│       └── app.js         ← Tailwind dark UI
+├── accounts.json
+├── updater.json
+└── mbot_state.db          ← auto-created on first run
+```
+
+---
+
+## Running
+
+### Step 1 — start the core worker (required, needs Win32)
+
+```bash
+python -m core.worker
+```
+
+This starts 5 daemon threads:
+
+| Thread | Interval | Job |
+|--------|----------|-----|
+| `scan` | 5 s | detect mBot window changes → write `mbots` table |
+| `poll` | 0.5 s | read HP/MP/KPH from each window → update `mbots` |
+| `chat` | 2 s | read all chat channels → write `chat` table |
+| `bsobj` | 60 s | dismiss BSObj/NetError/Error dialogs, trigger update if needed |
+| `cmd` | 0.5 s | read `commands` table, execute, mark done |
+
+### Step 2 — start a GUI (choose one)
+
+**PyQt6 (local desktop):**
+```bash
+python -m gui_qt.main
+```
+
+**Web UI (accessible over Tailscale):**
+```bash
+uvicorn gui_web.server:app --host 0.0.0.0 --port 8765
+```
+Then open `http://<tailscale-ip>:8765` from your phone.
+
+---
+
+## SQLite3 schema (`mbot_state.db`)
+
+| Table | Written by | Read by | Purpose |
+|-------|-----------|---------|---------|
+| `mbots` | worker | both GUIs | live mbot state (hp, mp, kph, is_dc) |
+| `logs` | worker | both GUIs | event log entries |
+| `chat` | worker | both GUIs | per-mbot per-channel chat snapshots |
+| `commands` | GUI | worker | command queue (GUI → worker) |
+| `inventory` | worker | gui_qt | inventory items per mbot per type |
+| `mbot_log` | worker | gui_qt | mBot event log (raw text) |
+
+---
+
+## Command reference
+
+Send a command from Python:
+```python
+from core import db
+db.enqueue_command("start_training", target_id=2)
+db.enqueue_command("login", params={"indices": [0, 1, 2]})
+```
+
+Or via REST:
+```bash
+curl -X POST http://localhost:8765/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"action": "start_training", "target_id": 2}'
+```
+
+| Action | `target_id` | `params` | Description |
+|--------|------------|---------|-------------|
+| `start_training` | mbot id | — | Start training |
+| `stop_training` | mbot id | — | Stop training |
+| `start_client` | mbot id | — | Start SRO client |
+| `kill_client` | mbot id | — | Kill SRO client |
+| `kill_mbot` | mbot id | — | Close mBot window |
+| `show_hide_mbot` | mbot id | — | Toggle mBot visibility |
+| `show_hide_client` | mbot id | — | Toggle client visibility |
+| `log_off` | mbot id | — | Log off character |
+| `reset` | mbot id | — | Reset mBot |
+| `get_position` | mbot id | — | Get + save current position |
+| `set_delay` | mbot id | — | Set relogin delay to 999 |
+| `get_inventory` | mbot id | `{"inv_type": "Inventory"}` | Fetch inventory → DB |
+| `get_mbot_log` | mbot id | — | Fetch event log → DB |
+| `login` | — | `{"indices": [0,1]}` | Full login sequence for accounts |
+| `hide_mbots` | — | `{"indices": [0,1]}` | Hide mBot windows by exe |
+| `start_training_all` | — | — | Start training on all mbots |
+| `run_update` | — | `{"indices": [0,1]}` or omit for all | Run SRO updater sequence |
+
+`target_id = null` applies the action to all live mBots.
+
+---
+
+## Web API
+
+Base URL: `http://localhost:8765`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/mbots` | List all live mbots |
+| `GET` | `/api/logs?limit=200` | Recent log entries |
+| `GET` | `/api/chat/{mbot_id}/{channel}` | Chat content |
+| `GET` | `/api/accounts` | Accounts (passwords stripped) |
+| `POST` | `/api/command` | Enqueue a command |
+| `WS` | `/ws` | Push state every 500 ms |
+
+WebSocket message format:
+```json
+{
+  "mbots": [ { "id": 1, "char": "Hero", "hp": 95.2, "mp": 80.0, "kph": "312", "is_dc": 0 } ],
+  "logs":  [ { "id": 42, "ts": "12:34:56", "msg": "...", "kind": "ok" } ]
+}
+```
+
+---
+
+## Dependencies (v2)
+
+```bash
+pip install PyQt6 pywin32 pywinauto uiautomation psutil fastapi uvicorn
+```
+
+---
 # mBot Manager (Vietnamese)
 
 Công cụ hỗ trợ quản lý nhiều mBot cùng lúc trên Silkroad Online (vSRO 110).
@@ -295,5 +466,166 @@ python mbot_manager.py [--autologin] [--update]
 
 - Chỉ chạy trên **Windows**.
 - Login sequence dùng delay cố định — máy yếu hoặc mạng lag có thể cần điều chỉnh thời gian chờ trong code.
+
+---
+
+# Kiến trúc v2 — Tách Core + GUI
+
+> Phần này mô tả kiến trúc mới được thêm song song với `mbot_manager.py` gốc (file gốc giữ nguyên, không sửa, dùng làm tham chiếu).
+
+## Tổng quan
+
+File monolithic gốc trộn lẫn Win32, Qt timer và UI vào một chỗ. Kiến trúc v2 tách thành 3 tầng:
+
+```
+┌─────────────────────────────────────┐
+│           Tầng GUI (chọn một)       │
+│   gui_qt/main.py  │  gui_web/       │
+│   (PyQt6, local)  │  (FastAPI+HTML) │
+└────────────┬──────┴────────┬────────┘
+             │  SQLite3 DB   │
+             │  (đọc state,  │
+             │   ghi lệnh)   │
+┌────────────▼───────────────▼────────┐
+│         core/worker.py              │
+│  (process nền, chỉ cần Win32)       │
+└─────────────────────────────────────┘
+```
+
+- **core/** — toàn bộ Win32, không phụ thuộc Qt, chạy độc lập như subprocess
+- **SQLite3** (`mbot_state.db`) — bus trạng thái chung giữa worker và GUI
+- **gui_qt/** — PyQt6 GUI đọc state từ DB, gửi lệnh qua DB
+- **gui_web/** — FastAPI + Tailwind, truy cập qua Tailscale từ điện thoại
+
+---
+
+## Cấu trúc thư mục
+
+```
+mbot_manager/
+├── mbot_manager.py        ← file gốc (tham chiếu, không sửa)
+├── core/
+│   ├── window.py          ← MBotWindow, win32 helpers, scan
+│   ├── db.py              ← SQLite3 schema + CRUD
+│   ├── worker.py          ← process nền (5 threads)
+│   └── login.py           ← login sequence (QTimer → threading)
+├── gui_qt/
+│   └── main.py            ← PyQt6 GUI, đọc DB, enqueue commands
+├── gui_web/
+│   ├── server.py          ← FastAPI + WebSocket
+│   └── static/
+│       ├── index.html
+│       └── app.js         ← Tailwind dark UI
+├── accounts.json
+├── updater.json
+└── mbot_state.db          ← tự tạo lần đầu chạy
+```
+
+---
+
+## Cách chạy
+
+### Bước 1 — khởi động core worker (bắt buộc, cần Win32)
+
+```bash
+python -m core.worker
+```
+
+Worker chạy 5 daemon thread:
+
+| Thread | Chu kỳ | Việc làm |
+|--------|--------|---------|
+| `scan` | 5 s | detect thay đổi cửa sổ mBot → ghi bảng `mbots` |
+| `poll` | 0.5 s | đọc HP/MP/KPH từng cửa sổ → update `mbots` |
+| `chat` | 2 s | đọc tất cả kênh chat → ghi bảng `chat` |
+| `bsobj` | 60 s | dismiss dialog BSObj/NetError/Error, kích update nếu cần |
+| `cmd` | 0.5 s | đọc bảng `commands`, thực thi, đánh dấu done |
+
+### Bước 2 — khởi động GUI (chọn một)
+
+**PyQt6 (desktop local):**
+```bash
+python -m gui_qt.main
+```
+
+**Web UI (điều khiển qua điện thoại qua Tailscale):**
+```bash
+uvicorn gui_web.server:app --host 0.0.0.0 --port 8765
+```
+Mở `http://<tailscale-ip>:8765` trên điện thoại.
+
+---
+
+## Schema SQLite3 (`mbot_state.db`)
+
+| Bảng | Ghi bởi | Đọc bởi | Mục đích |
+|------|---------|---------|---------|
+| `mbots` | worker | cả 2 GUI | trạng thái live (hp, mp, kph, is_dc) |
+| `logs` | worker | cả 2 GUI | log sự kiện |
+| `chat` | worker | cả 2 GUI | snapshot chat từng mbot, từng kênh |
+| `commands` | GUI | worker | hàng đợi lệnh (GUI → worker) |
+| `inventory` | worker | gui_qt | items inventory theo loại |
+| `mbot_log` | worker | gui_qt | event log raw từ mBot |
+
+---
+
+## Danh sách lệnh (command reference)
+
+Gửi lệnh từ Python:
+```python
+from core import db
+db.enqueue_command("start_training", target_id=2)
+db.enqueue_command("login", params={"indices": [0, 1, 2]})
+```
+
+Hoặc qua REST:
+```bash
+curl -X POST http://localhost:8765/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"action": "start_training", "target_id": 2}'
+```
+
+| Action | `target_id` | `params` | Mô tả |
+|--------|------------|---------|-------|
+| `start_training` | mbot id | — | Bắt đầu train |
+| `stop_training` | mbot id | — | Dừng train |
+| `start_client` | mbot id | — | Mở SRO client |
+| `kill_client` | mbot id | — | Tắt SRO client |
+| `kill_mbot` | mbot id | — | Đóng cửa sổ mBot |
+| `show_hide_mbot` | mbot id | — | Ẩn/hiện cửa sổ mBot |
+| `show_hide_client` | mbot id | — | Ẩn/hiện client |
+| `log_off` | mbot id | — | Đăng xuất nhân vật |
+| `reset` | mbot id | — | Reset mBot |
+| `get_position` | mbot id | — | Lấy + lưu tọa độ hiện tại |
+| `set_delay` | mbot id | — | Đặt delay relogin = 999 |
+| `get_inventory` | mbot id | `{"inv_type": "Inventory"}` | Lấy inventory → ghi DB |
+| `get_mbot_log` | mbot id | — | Lấy event log → ghi DB |
+| `login` | — | `{"indices": [0,1]}` | Chạy login sequence cho accounts |
+| `hide_mbots` | — | `{"indices": [0,1]}` | Ẩn cửa sổ mBot theo exe |
+| `start_training_all` | — | — | Start training tất cả mBot |
+| `run_update` | — | `{"indices": [0,1]}` hoặc bỏ qua để update tất cả | Chạy update SRO |
+
+`target_id = null` áp dụng lệnh cho tất cả mBot đang chạy.
+
+---
+
+## Web API
+
+Base URL: `http://localhost:8765`
+
+| Method | Path | Mô tả |
+|--------|------|-------|
+| `GET` | `/api/mbots` | Danh sách mBot live |
+| `GET` | `/api/logs?limit=200` | Log gần nhất |
+| `GET` | `/api/chat/{mbot_id}/{channel}` | Nội dung chat |
+| `GET` | `/api/accounts` | Danh sách account (không có password) |
+| `POST` | `/api/command` | Enqueue lệnh |
+| `WS` | `/ws` | Push state mỗi 500 ms |
+
+## Dependencies (v2)
+
+```bash
+pip install PyQt6 pywin32 pywinauto uiautomation psutil fastapi uvicorn
+```
 
 ---

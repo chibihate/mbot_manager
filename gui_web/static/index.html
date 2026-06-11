@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MBot Manager</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            bg:      '#1a1a24',
+            panel:   '#1e1e2e',
+            deep:    '#13131b',
+            border:  '#2a2a3e',
+            accent:  '#7c6af7',
+            success: '#6dc28a',
+            warn:    '#d6b35a',
+            danger:  '#d35d5d',
+            mute:    '#6b6b80',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #1a1a24; font-family: 'JetBrains Mono', 'Consolas', monospace; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #13131b; }
+    ::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 2px; }
+    .bar { transition: width 0.3s ease; }
+  </style>
+</head>
+<body class="text-gray-200 min-h-screen flex flex-col">
+
+  <!-- Title bar -->
+  <header class="bg-panel border-b border-border px-4 py-2 flex items-center gap-4">
+    <span class="font-bold text-sm tracking-wide">MBot Manager</span>
+    <span class="text-mute text-xs">v0.2.0</span>
+    <span id="online-pill" class="ml-auto bg-deep text-success text-xs px-3 py-1 rounded">● 0 online</span>
+    <span id="ws-status" class="text-xs text-mute">⬤ connecting…</span>
+  </header>
+
+  <!-- Nav -->
+  <nav class="bg-panel border-b border-border flex gap-0 text-xs">
+    <button class="nav-btn active" data-tab="dashboard">Dashboard</button>
+    <button class="nav-btn" data-tab="accounts">Accounts</button>
+    <button class="nav-btn" data-tab="chat">Chat</button>
+    <button class="nav-btn" data-tab="log">Log</button>
+  </nav>
+
+  <!-- Content -->
+  <main class="flex-1 overflow-hidden">
+
+    <!-- Dashboard -->
+    <section id="tab-dashboard" class="tab h-full flex flex-col gap-0">
+      <!-- mbot cards -->
+      <div id="mbot-grid" class="p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2"></div>
+
+      <!-- Actions -->
+      <div class="mt-auto bg-deep border-t border-border p-3">
+        <div class="text-xs text-mute mb-2 uppercase tracking-wider">Actions
+          <span id="sel-pill" class="ml-2 bg-panel px-2 py-0.5 rounded text-accent">0 selected</span>
+        </div>
+        <div class="grid grid-cols-4 gap-2 text-xs">
+          <button class="action-btn" data-action="refresh">Refresh</button>
+          <button class="action-btn" data-action="show_hide_mbot">Show/Hide</button>
+          <button class="action-btn danger" data-action="kill_mbot">Kill mBot</button>
+          <button class="action-btn" data-action="start_client">Start Client</button>
+          <button class="action-btn" data-action="show_hide_client">Hide Client</button>
+          <button class="action-btn danger" data-action="kill_client">Kill Client</button>
+          <button class="action-btn" data-action="log_off">Log Off</button>
+          <button class="action-btn" data-action="reset">Reset</button>
+          <button class="action-btn" data-action="get_position">Get Pos</button>
+          <button class="action-btn success" data-action="start_training">Start Train</button>
+          <button class="action-btn warn" data-action="stop_training">Stop Train</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Accounts -->
+    <section id="tab-accounts" class="tab hidden p-4">
+      <div class="flex items-center gap-2 mb-3">
+        <span class="text-xs text-mute uppercase tracking-wider">Accounts</span>
+        <button class="action-btn success ml-auto" onclick="loginSelected()">Login selected</button>
+        <button class="action-btn" onclick="hideAllMbots()">Hide mBots</button>
+      </div>
+      <div id="account-list" class="space-y-1 text-xs"></div>
+    </section>
+
+    <!-- Chat -->
+    <section id="tab-chat" class="tab hidden p-4 flex flex-col gap-3 h-full">
+      <div class="flex gap-2 text-xs flex-wrap">
+        <select id="chat-mbot" class="bg-deep border border-border rounded px-2 py-1 text-xs"></select>
+        <select id="chat-channel" class="bg-deep border border-border rounded px-2 py-1 text-xs">
+          <option>Allchat</option><option>PM</option><option>Party</option>
+          <option>Guild</option><option>Global</option><option>Academy</option>
+          <option>GM</option><option>Union</option><option>Unique</option>
+        </select>
+        <button class="action-btn" onclick="loadChat()">Load</button>
+      </div>
+      <pre id="chat-content" class="flex-1 bg-deep border border-border rounded p-3 text-xs overflow-auto whitespace-pre-wrap text-gray-300"></pre>
+    </section>
+
+    <!-- Log -->
+    <section id="tab-log" class="tab hidden p-4 h-full">
+      <div id="log-content" class="h-full bg-deep border border-border rounded p-3 text-xs overflow-auto font-mono space-y-0.5"></div>
+    </section>
+
+  </main>
+
+  <style>
+    .nav-btn {
+      padding: 8px 16px;
+      color: #6b6b80;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+    }
+    .nav-btn.active, .nav-btn:hover { color: #e0e0f0; }
+    .nav-btn.active { border-bottom-color: #7c6af7; }
+
+    .action-btn {
+      background: #1e1e2e;
+      border: 1px solid #2a2a3e;
+      color: #c0c0d8;
+      padding: 5px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .action-btn:hover { background: #2a2a3e; }
+    .action-btn.success { border-color: #6dc28a; color: #6dc28a; }
+    .action-btn.warn    { border-color: #d6b35a; color: #d6b35a; }
+    .action-btn.danger  { border-color: #d35d5d; color: #d35d5d; }
+
+    .mbot-card {
+      background: #1e1e2e;
+      border: 1px solid #2a2a3e;
+      border-radius: 6px;
+      padding: 10px 12px;
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.15s;
+    }
+    .mbot-card.selected { border-color: #7c6af7; background: #23233a; }
+    .mbot-card.dc       { opacity: 0.5; }
+  </style>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
